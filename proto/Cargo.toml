@@ -1,0 +1,14 @@
+[package]
+name = "proto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["macros", "rt", "io-util"] }
