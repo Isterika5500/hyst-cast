@@ -109,7 +109,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&p.name).strong());
                     if let Some(s) = &p.stream {
-                        ui.colored_label(RED, "● стримит");
+                        ui.colored_label(RED, "🔴 стримит");
                         ui.label(egui::RichText::new(format!("{}p{}", s.height, s.fps)).color(DIM));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if p.watching {
@@ -150,7 +150,7 @@ impl App {
         ui.add_space(4.0);
         if let Some(pv) = publishing {
             ui.horizontal(|ui| {
-                ui.colored_label(RED, "● в эфире");
+                ui.colored_label(RED, "🔴 в эфире");
                 if let Some(i) = &pv.info {
                     ui.label(format!("{}×{} · {} fps{}", i.width, i.height, i.fps, if i.has_audio { " · со звуком" } else { " · без звука" }));
                 }
@@ -158,7 +158,7 @@ impl App {
             ui.label(egui::RichText::new(&pv.stats).small().color(DIM));
             ui.label(if pv.viewers.is_empty() { "Пока никто не смотрит".to_string() } else { format!("Смотрят: {}", pv.viewers.join(", ")) });
             ui.add_space(6.0);
-            if ui.add_sized([ui.available_width(), 30.0], egui::Button::new("■ Остановить стрим")).clicked() {
+            if ui.add_sized([ui.available_width(), 30.0], egui::Button::new("⏹ Остановить стрим")).clicked() {
                 let _ = self.tx.send(Cmd::Stop);
             }
         } else {
@@ -176,7 +176,7 @@ impl App {
                                 ui.selectable_value(&mut self.source_idx, i, label);
                             }
                         });
-                    if ui.button("⟳").on_hover_text("Обновить список окон").clicked() {
+                    if ui.button("🔄").on_hover_text("Обновить список окон").clicked() {
                         self.sources = capture::list_sources();
                     }
                 });
@@ -194,7 +194,7 @@ impl App {
             });
             ui.add_space(6.0);
             ui.add_enabled_ui(!starting, |ui| {
-                let label = if starting { "Запуск… (выбери экран, если спросят)" } else { "● Начать стрим" };
+                let label = if starting { "Запуск… (выбери экран, если спросят)" } else { "▶ Начать стрим" };
                 if ui.add_sized([ui.available_width(), 32.0], egui::Button::new(label)).clicked() {
                     if let Some((src, _)) = self.sources.get(self.source_idx).cloned() {
                         self.cfg.save();
@@ -232,7 +232,7 @@ impl eframe::App for App {
                 ui.label(egui::RichText::new("hyst-cast").strong());
                 match &status {
                     Status::Online => {
-                        ui.colored_label(GREEN, "● в сети");
+                        ui.colored_label(GREEN, "🟢 в сети");
                         if let Some(r) = rtt {
                             ui.label(egui::RichText::new(format!("{r} мс")).color(DIM));
                         }
