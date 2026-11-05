@@ -1,6 +1,7 @@
 //! Настройки: файл config.toml в папке настроек пользователя.
-//! Адрес сервера, отпечаток и пароль вшиваются при сборке (HYST_CAST_SERVER / _FP / _TOKEN),
-//! так что друзьям достаточно ввести имя и комнату.
+//! Адрес сервера, отпечаток и пароль берутся из `server.toml` рядом с exe (кладётся в zip для друзей)
+//! или вшиваются при локальной сборке (HYST_CAST_SERVER / _FP / _TOKEN). Друзьям достаточно
+//! ввести имя и комнату. В публичном CI секретов нет — server.toml добавляется уже после сборки.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -63,6 +64,24 @@ impl Default for Config {
     }
 }
 
+/// Настройки сервера, которые лежат рядом с exe.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ServerFile {
+    server: String,
+    fingerprint: String,
+    token: String,
+}
+
+fn server_file() -> ServerFile {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("server.toml")))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
 pub fn dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(std::env::temp_dir).join("hyst-cast")
 }
@@ -73,8 +92,14 @@ impl Config {
             .ok()
             .and_then(|s| toml::from_str(&s).ok())
             .unwrap_or_default();
-        // Пустые поля сервера — берём вшитые при сборке
-        let d = Config::default();
+        // Пустые поля сервера — из server.toml рядом с exe, иначе вшитые при сборке
+        let mut d = Config::default();
+        let f = server_file();
+        if !f.server.is_empty() {
+            d.server = f.server;
+            d.fingerprint = f.fingerprint;
+            d.token = f.token;
+        }
         if c.server.is_empty() {
             c.server = d.server;
         }

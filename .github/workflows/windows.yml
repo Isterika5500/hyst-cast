@@ -48,12 +48,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Секретов здесь нет намеренно: артефакты публичного репозитория доступны всем.
+      # Адрес и пароль сервера кладутся в zip (server.toml) уже локально.
       - name: Сборка
         shell: pwsh
-        env:
-          HYST_CAST_SERVER: ${{ secrets.HYST_CAST_SERVER }}
-          HYST_CAST_FP: ${{ secrets.HYST_CAST_FP }}
-          HYST_CAST_TOKEN: ${{ secrets.HYST_CAST_TOKEN }}
         run: cargo build --release --locked -p hyst-cast -p hyst-cast-server
 
       - name: Упаковка
