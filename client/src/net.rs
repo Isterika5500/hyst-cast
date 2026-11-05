@@ -293,14 +293,15 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
                 Some(Cmd::Start { source, preset, audio, encoder, portal_token }) => {
                     if publisher.is_some() || shared.lock().unwrap().starting { continue }
                     set(shared, repaint, |s| { s.starting = true; s.notice = None; });
-                    let (ptx, prx) = mpsc::channel::<Vec<u8>>(publish::SEND_QUEUE);
+                    let (ptx, prx) = mpsc::channel::<publish::Out>(publish::SEND_QUEUE);
                     let st = start_tx.clone();
                     let conn2 = conn.clone();
+                    let link = Arc::new(publish::Link::default());
                     tokio::spawn(async move {
-                        let r = publish::start(source, preset, audio, encoder, portal_token, ptx).await;
-                        if r.is_ok() {
+                        let r = publish::start(source, preset, audio, encoder, portal_token, ptx, link.clone()).await;
+                        if let Ok(p) = &r {
                             // отправитель запускается здесь, чтобы не потерять первые кадры
-                            tokio::spawn(send_media(conn2, prx));
+                            tokio::spawn(send_media(conn2, prx, link, p.encoder_element()));
                         }
                         let _ = st.send(r);
                     });
@@ -357,6 +358,7 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
                         set(shared, repaint, |s| { if let Some(p) = s.peers.get_mut(&id) { p.stream = None; p.watching = false; p.stats.clear(); } s.watch.remove(&id); });
                     }
                     ServerMsg::KeyframeRequest => if let Some(p) = &publisher { p.force_keyframe(); },
+                    ServerMsg::SlowViewer { name } => if let Some(p) = publisher.as_mut() { p.slow_viewer(&name); },
                     ServerMsg::Viewers { names } => set(shared, repaint, |s| if let Some(p) = s.publishing.as_mut() { p.viewers = names; }),
                     ServerMsg::Pong { ts } => set(shared, repaint, |s| s.rtt_ms = Some(now_ms().saturating_sub(ts) as u32)),
                     ServerMsg::Error { message } => set(shared, repaint, |s| s.notice = Some(message)),
@@ -414,10 +416,10 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
                         let (fps, kbps, drops, frames, ap) = (p.fps_now, p.kbps_now, p.drops(), p.frames(), p.audio_packets());
                         let target = p.kbps.load(Ordering::Relaxed);
                         let enc = p.encoder.label();
+                        let limited = if target < p.info_target_kbps() { format!(" · снижено (канал{})", if p.slow_name.is_empty() { String::new() } else { format!(" у {}", p.slow_name) }) } else { String::new() };
                         set(shared, repaint, |s| if let Some(pv) = s.publishing.as_mut() {
                             pv.fps = fps; pv.kbps = kbps; pv.drops = drops; pv.frames = frames; pv.audio_packets = ap;
-                            pv.stats = format!("{fps:.0} fps · {:.1} Мбит/с (цель {:.1}) · {enc}{}", kbps / 1000.0, target as f64 / 1000.0,
-                                if drops > 0 { format!(" · выкинуто кадров: {drops}") } else { String::new() });
+                            pv.stats = format!("{fps:.0} fps · {:.1} Мбит/с (цель {:.1}){limited} · {enc}", kbps / 1000.0, target as f64 / 1000.0);
                         });
                     }
                 }
@@ -473,12 +475,47 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
 }
 
 /// Отправка пакетов стрима: каждый пакет — свой uni-поток, строго по порядку.
-async fn send_media(conn: quinn::Connection, mut rx: mpsc::Receiver<Vec<u8>>) {
-    while let Some(pkt) = rx.recv().await {
+/// Звук идёт с приоритетом и обгоняет видео. Застрявшее в очереди видео выкидывается до ключевого кадра:
+/// лучше пропустить полсекунды, чем копить задержку.
+async fn send_media(conn: quinn::Connection, mut rx: mpsc::Receiver<publish::Out>, link: Arc<publish::Link>, enc: gstreamer::Element) {
+    use gstreamer::prelude::*;
+    const VIDEO_MAX_AGE: Duration = Duration::from_millis(250);
+    const AUDIO_MAX_AGE: Duration = Duration::from_millis(400);
+    let mut last_kf = Instant::now() - Duration::from_secs(1);
+    while let Some(o) = rx.recv().await {
+        let age = o.t.elapsed();
+        if o.video {
+            if link.need_key.load(Ordering::Relaxed) && !o.key {
+                link.stale.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if o.key {
+                link.need_key.store(false, Ordering::Relaxed);
+            } else if age > VIDEO_MAX_AGE {
+                link.stale.fetch_add(1, Ordering::Relaxed);
+                link.need_key.store(true, Ordering::Relaxed);
+                if last_kf.elapsed() > Duration::from_millis(300) {
+                    last_kf = Instant::now();
+                    if let Some(pad) = enc.static_pad("src") {
+                        pad.send_event(gstreamer_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build());
+                    }
+                }
+                continue;
+            }
+        } else if age > AUDIO_MAX_AGE {
+            link.stale.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let Ok(mut s) = conn.open_uni().await else { break };
-        if s.write_all(&pkt).await.is_err() {
+        let _ = s.set_priority(if o.video { 0 } else { 10 });
+        if s.write_all(&o.pkt).await.is_err() {
             break;
         }
         let _ = s.finish();
+        if o.video {
+            let d = o.t.elapsed().as_micros() as u64;
+            let old = link.delay_us.load(Ordering::Relaxed);
+            link.delay_us.store((old * 7 + d) / 8, Ordering::Relaxed);
+        }
     }
 }

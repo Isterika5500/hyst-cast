@@ -59,6 +59,8 @@ pub enum ServerMsg {
     /// Стримеру: кто сейчас смотрит.
     Viewers { names: Vec<String> },
     Pong { ts: u64 },
+    /// Стримеру: этому зрителю не хватает канала — стоит снизить битрейт.
+    SlowViewer { name: String },
 }
 
 pub async fn write_msg<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {

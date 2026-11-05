@@ -150,6 +150,7 @@ fn wait_until(what: &str, timeout: Duration, mut f: impl FnMut() -> Option<Resul
 /// Полный цикл без окна. Код возврата 0 — всё работает.
 fn selftest(args: &[String]) -> Result<()> {
     let server = arg(args, "--server").unwrap_or_else(|| "127.0.0.1:4433".into());
+    let viewer_server = arg(args, "--viewer-server").unwrap_or_else(|| server.clone());
     let fingerprint = match (arg(args, "--fp"), arg(args, "--cert")) {
         (Some(fp), _) => fp,
         (None, Some(cert)) => tls::fingerprint_of_file(&cert)?,
@@ -163,8 +164,8 @@ fn selftest(args: &[String]) -> Result<()> {
     let room = format!("selftest-{}", std::process::id());
 
     let rt = runtime()?;
-    let mk = |name: &str| config::Config {
-        server: server.clone(),
+    let mk = |name: &str, server: &str| config::Config {
+        server: server.to_string(),
         fingerprint: fingerprint.clone(),
         token: token.clone(),
         name: name.into(),
@@ -187,9 +188,9 @@ fn selftest(args: &[String]) -> Result<()> {
         }
     };
     println!("[1/5] подключение к {server}");
-    ta.send(net::Cmd::Connect(mk("Стример"))).ok();
+    ta.send(net::Cmd::Connect(mk("Стример", &server))).ok();
     wait_until("стример в сети", Duration::from_secs(15), || online(&sa)).context("стример не подключился")?;
-    tb.send(net::Cmd::Connect(mk("Зритель"))).ok();
+    tb.send(net::Cmd::Connect(mk("Зритель", &viewer_server))).ok();
     wait_until("зритель в сети", Duration::from_secs(15), || online(&sb)).context("зритель не подключился")?;
     let a_id = sa.lock().unwrap().my_id;
 

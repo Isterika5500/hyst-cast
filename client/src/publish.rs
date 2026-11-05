@@ -17,6 +17,25 @@ use tracing::{info, warn};
 /// Очередь пакетов на отправку (~1 с при 60 fps + звук). Переполнилась — канал не тянет.
 pub const SEND_QUEUE: usize = 120;
 
+/// Пакет в очереди на отправку.
+pub struct Out {
+    pub pkt: Vec<u8>,
+    pub video: bool,
+    pub key: bool,
+    pub t: Instant,
+}
+
+/// Общее между кодером и отправителем: ожидание ключевого кадра и признаки затора.
+#[derive(Default)]
+pub struct Link {
+    pub need_key: AtomicBool,
+    pub want_key: AtomicBool,
+    /// Сглаженное время «кадр готов → сдан в QUIC», мкс. Растёт — канал не тянет.
+    pub delay_us: AtomicU64,
+    /// Выкинуто отправителем как устаревшее.
+    pub stale: AtomicU64,
+}
+
 #[derive(Default)]
 pub struct PubStats {
     pub frames: AtomicU64,
@@ -26,9 +45,8 @@ pub struct PubStats {
 }
 
 struct Shared {
-    tx: mpsc::Sender<Vec<u8>>,
-    need_key: AtomicBool,
-    want_key: AtomicBool,
+    tx: mpsc::Sender<Out>,
+    link: Arc<Link>,
     stats: PubStats,
     first_frame: AtomicBool,
 }
@@ -49,6 +67,8 @@ pub struct Publisher {
     pub fps_now: f64,
     pub kbps_now: f64,
     pub portal_token: Option<String>,
+    slow_viewers: u32,
+    pub slow_name: String,
     _capture: Option<Capture>,
 }
 
@@ -65,7 +85,8 @@ pub async fn start(
     audio: bool,
     force_encoder: String,
     portal_token: Option<String>,
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<Out>,
+    link: Arc<Link>,
 ) -> Result<Publisher> {
     let capture = capture::open(&source, preset.fps, portal_token).await?;
     let test = source == Source::Test;
@@ -87,7 +108,8 @@ pub async fn start(
         let vd = video_desc.clone();
         let tx = tx.clone();
         let e2 = enc.clone();
-        let r = tokio::task::spawn_blocking(move || try_start(&vd, &e2, preset, audio_ok, test, tx)).await?;
+        let link = link.clone();
+        let r = tokio::task::spawn_blocking(move || try_start(&vd, &e2, preset, audio_ok, test, tx, link)).await?;
         match r {
             Ok(mut p) => {
                 p.portal_token = capture.portal_token.clone();
@@ -137,7 +159,7 @@ fn probe_audio(desc: &str) -> bool {
     ok
 }
 
-fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, test: bool, tx: mpsc::Sender<Vec<u8>>) -> Result<Publisher> {
+fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, test: bool, tx: mpsc::Sender<Out>, link: Arc<Link>) -> Result<Publisher> {
     let mut desc = format!(
         "{video_desc} ! queue max-size-buffers=3 max-size-time=0 max-size-bytes=0 leaky=downstream ! {} ! {} name=enc ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=vsink sync=false max-buffers=8",
         encoder.convert_desc(preset.width, preset.height),
@@ -156,8 +178,10 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, t
 
     let shared = Arc::new(Shared {
         tx,
-        need_key: AtomicBool::new(true),
-        want_key: AtomicBool::new(false),
+        link: {
+            link.need_key.store(true, Ordering::Relaxed);
+            link
+        },
         stats: PubStats::default(),
         first_frame: AtomicBool::new(false),
     });
@@ -247,6 +271,8 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, t
         fps_now: 0.0,
         kbps_now: 0.0,
         portal_token: None,
+        slow_viewers: 0,
+        slow_name: String::new(),
         _capture: None,
     })
 }
@@ -264,13 +290,13 @@ fn on_sample(sh: &Shared, kind: MediaKind, sample: &gst::Sample) {
 
     if kind == MediaKind::Video {
         sh.first_frame.store(true, Ordering::Relaxed);
-        if sh.need_key.load(Ordering::Relaxed) {
+        if sh.link.need_key.load(Ordering::Relaxed) {
             if !key {
                 sh.stats.drops.fetch_add(1, Ordering::Relaxed);
-                sh.want_key.store(true, Ordering::Relaxed);
+                sh.link.want_key.store(true, Ordering::Relaxed);
                 return;
             }
-            sh.need_key.store(false, Ordering::Relaxed);
+            sh.link.need_key.store(false, Ordering::Relaxed);
         }
     }
 
@@ -278,7 +304,8 @@ fn on_sample(sh: &Shared, kind: MediaKind, sample: &gst::Sample) {
     MediaHeader { publisher: 0, kind, flags: if key { FLAG_KEY } else { 0 }, pts_us }.write(&mut pkt);
     pkt.extend_from_slice(map.as_slice());
     let len = pkt.len() as u64;
-    match sh.tx.try_send(pkt) {
+    let video = kind == MediaKind::Video;
+    match sh.tx.try_send(Out { pkt, video, key, t: Instant::now() }) {
         Ok(()) => {
             if kind == MediaKind::Video {
                 sh.stats.frames.fetch_add(1, Ordering::Relaxed);
@@ -291,8 +318,8 @@ fn on_sample(sh: &Shared, kind: MediaKind, sample: &gst::Sample) {
             sh.stats.drops.fetch_add(1, Ordering::Relaxed);
             if kind == MediaKind::Video {
                 // Дальше P-кадры без выброшенного бессмысленны — ждём ключевой
-                sh.need_key.store(true, Ordering::Relaxed);
-                sh.want_key.store(true, Ordering::Relaxed);
+                sh.link.need_key.store(true, Ordering::Relaxed);
+                sh.link.want_key.store(true, Ordering::Relaxed);
             }
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {}
@@ -312,7 +339,26 @@ impl Publisher {
     }
 
     pub fn drops(&self) -> u64 {
-        self.shared.stats.drops.load(Ordering::Relaxed)
+        self.shared.stats.drops.load(Ordering::Relaxed) + self.shared.link.stale.load(Ordering::Relaxed)
+    }
+
+    /// Задержка отправки, мс (сглаженная).
+    pub fn send_delay_ms(&self) -> u64 {
+        self.shared.link.delay_us.load(Ordering::Relaxed) / 1000
+    }
+
+    pub fn info_target_kbps(&self) -> u32 {
+        self.target_kbps
+    }
+
+    /// Сервер сообщил, что зрителю не хватает канала.
+    pub fn slow_viewer(&mut self, name: &str) {
+        self.slow_viewers += 1;
+        self.slow_name = name.to_string();
+    }
+
+    pub fn encoder_element(&self) -> gst::Element {
+        self.enc.clone()
     }
 
     pub fn audio_packets(&self) -> u64 {
@@ -325,7 +371,8 @@ impl Publisher {
 
     /// Раз в ~0.5 с: ключевой кадр по запросу, статистика, подстройка битрейта под канал.
     pub fn tick(&mut self) {
-        if self.shared.want_key.swap(false, Ordering::Relaxed) {
+        let slow = std::mem::take(&mut self.slow_viewers) > 0;
+        if self.shared.link.want_key.swap(false, Ordering::Relaxed) {
             self.force_keyframe();
         }
         let (t0, f0, b0) = self.last;
@@ -342,17 +389,19 @@ impl Publisher {
         let drops = self.drops();
         let cur = self.kbps.load(Ordering::Relaxed);
         let min = (self.target_kbps / 6).max(500);
-        if drops > self.last_drops {
+        let delay = self.send_delay_ms();
+        if drops > self.last_drops || delay > 150 || slow {
             let new = ((cur as f64 * 0.7) as u32).max(min);
             if new != cur {
-                info!("канал не тянет: битрейт {cur} → {new} кбит/с");
+                let who = if slow { format!(", зрителю {} не хватает канала", self.slow_name) } else { String::new() };
+                info!("канал не тянет (задержка {delay} мс{who}): битрейт {cur} → {new} кбит/с");
                 self.encoder.set_bitrate(&self.enc, new);
                 self.kbps.store(new, Ordering::Relaxed);
             }
             self.calm = 0;
         } else {
             self.calm += 1;
-            if self.calm >= 6 && cur < self.target_kbps {
+            if self.calm >= 6 && cur < self.target_kbps && delay < 60 {
                 let new = ((cur as f64 * 1.15) as u32).min(self.target_kbps);
                 self.encoder.set_bitrate(&self.enc, new);
                 self.kbps.store(new, Ordering::Relaxed);

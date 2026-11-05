@@ -28,8 +28,11 @@ const SUB_QUEUE: usize = 240;
 /// Не чаще одного запроса ключевого кадра у стримера.
 const KEYFRAME_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Пакет в очереди к зрителю: когда пришёл, сам пакет, видео ли, ключевой ли.
+type Fwd = (Instant, Bytes, bool, bool);
+
 struct Sub {
-    tx: mpsc::Sender<Bytes>,
+    tx: mpsc::Sender<Fwd>,
     /// Зритель отстал/только подключился — ждём ключевой кадр, остальное видео выкидываем.
     need_key: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
@@ -151,7 +154,7 @@ pub fn transport_config() -> quinn::TransportConfig {
     t.receive_window((32u32 << 20).into());
     // Небольшое окно отправки: если канал не тянет, пакеты копятся в НАШЕЙ очереди,
     // где мы умеем выкидывать старое, а не в недрах QUIC, где они превращаются в задержку.
-    t.send_window(1_500_000);
+    t.send_window(600_000);
     t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     t
 }
@@ -270,7 +273,8 @@ async fn handle_conn(state: Arc<State>, conn: quinn::Connection) -> Result<()> {
                         }
                         sub.need_key.store(false, Ordering::Relaxed);
                     }
-                    if sub.tx.try_send(pkt.clone()).is_err() {
+                    let fwd = (Instant::now(), pkt.clone(), hdr.kind == MediaKind::Video, hdr.is_key());
+                    if sub.tx.try_send(fwd).is_err() {
                         sub.dropped.fetch_add(1, Ordering::Relaxed);
                         if hdr.kind == MediaKind::Video {
                             sub.need_key.store(true, Ordering::Relaxed);
@@ -361,9 +365,10 @@ async fn control_loop(state: &Arc<State>, conn: &quinn::Connection, recv: &mut q
                 if t.stream.is_none() {
                     continue;
                 }
-                let (tx, rx) = mpsc::channel::<Bytes>(SUB_QUEUE);
+                let (tx, rx) = mpsc::channel::<Fwd>(SUB_QUEUE);
                 let sub = Sub { tx, need_key: Arc::new(AtomicBool::new(true)), dropped: Arc::new(AtomicU64::new(0)) };
-                spawn_forwarder(conn.clone(), rx);
+                let viewer_name = r.peers.get(&id).map(|p| p.name.clone()).unwrap_or_default();
+                spawn_forwarder(conn.clone(), rx, sub.need_key.clone(), sub.dropped.clone(), t.ctl.clone(), t.last_keyreq.clone(), viewer_name);
                 t.watchers.lock().unwrap().insert(id, sub);
                 t.last_keyreq.lock().map(|mut l| *l = Instant::now() - KEYFRAME_INTERVAL).ok();
                 request_keyframe(&t.ctl, &t.last_keyreq);
@@ -389,10 +394,45 @@ async fn control_loop(state: &Arc<State>, conn: &quinn::Connection, recv: &mut q
 }
 
 /// Пересылка пакетов одной подписки зрителю: каждый пакет — свой uni-поток.
-fn spawn_forwarder(conn: quinn::Connection, mut rx: mpsc::Receiver<Bytes>) {
+/// Звук с приоритетом. Видео, застрявшее в очереди (зритель не тянет), выкидывается до ключевого кадра.
+fn spawn_forwarder(
+    conn: quinn::Connection,
+    mut rx: mpsc::Receiver<Fwd>,
+    need_key: Arc<AtomicBool>,
+    dropped: Arc<AtomicU64>,
+    ctl: mpsc::UnboundedSender<ServerMsg>,
+    last: Arc<Mutex<Instant>>,
+    viewer_name: String,
+) {
+    const VIDEO_MAX_AGE: Duration = Duration::from_millis(300);
+    const AUDIO_MAX_AGE: Duration = Duration::from_millis(500);
     tokio::spawn(async move {
-        while let Some(pkt) = rx.recv().await {
+        let mut last_slow = Instant::now() - Duration::from_secs(10);
+        while let Some((t, pkt, video, key)) = rx.recv().await {
+            if video {
+                if need_key.load(Ordering::Relaxed) && !key {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if key {
+                    need_key.store(false, Ordering::Relaxed);
+                } else if t.elapsed() > VIDEO_MAX_AGE {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                    need_key.store(true, Ordering::Relaxed);
+                    request_keyframe(&ctl, &last);
+                    // Зритель не тянет — просим стримера снизить битрейт (не чаще раза в секунду)
+                    if last_slow.elapsed() > Duration::from_secs(1) {
+                        last_slow = Instant::now();
+                        let _ = ctl.send(ServerMsg::SlowViewer { name: viewer_name.clone() });
+                    }
+                    continue;
+                }
+            } else if t.elapsed() > AUDIO_MAX_AGE {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             let Ok(mut s) = conn.open_uni().await else { break };
+            let _ = s.set_priority(if video { 0 } else { 10 });
             if s.write_all(&pkt).await.is_err() {
                 break;
             }

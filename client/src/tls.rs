@@ -63,7 +63,7 @@ pub fn transport_config() -> quinn::TransportConfig {
     t.stream_receive_window((8u32 << 20).into());
     t.receive_window((32u32 << 20).into());
     // См. сервер: маленькое окно отправки — затор копится в нашей очереди, где мы умеем выкидывать кадры.
-    t.send_window(1_500_000);
+    t.send_window(600_000);
     t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     t
 }
