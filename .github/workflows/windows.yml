@@ -1,0 +1,96 @@
+name: windows
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  GST_VERSION: "1.28.8"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Кеш установщика GStreamer
+        uses: actions/cache@v4
+        with:
+          path: gst-installer
+          key: gst-installer-${{ env.GST_VERSION }}
+
+      - name: Установка GStreamer
+        shell: pwsh
+        run: |
+          $exe = "gst-installer/gstreamer-$env:GST_VERSION.exe"
+          if (!(Test-Path $exe)) {
+            New-Item -ItemType Directory -Force gst-installer | Out-Null
+            Invoke-WebRequest "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GST_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$env:GST_VERSION.exe" -OutFile $exe
+          }
+          $p = Start-Process $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/ALLUSERS','/TYPE=full','/LOG=gst-install.log' -Wait -PassThru
+          "код установщика: $($p.ExitCode)"
+          $root = Get-ChildItem 'C:\Program Files\gstreamer\1.0' -Directory | Where-Object Name -like 'msvc*' | Select-Object -First 1
+          if (!$root) { Get-Content gst-install.log -Tail 40; throw "GStreamer не установился" }
+          "GSTREAMER_ROOT=$($root.FullName)" | Out-File -Append $env:GITHUB_ENV
+          "PKG_CONFIG_PATH=$($root.FullName)\lib\pkgconfig" | Out-File -Append $env:GITHUB_ENV
+          "$($root.FullName)\bin" | Out-File -Append $env:GITHUB_PATH
+          "корень: $($root.FullName)"
+          Get-ChildItem "$($root.FullName)\lib\pkgconfig" -Filter 'gstreamer-1.0.pc' | Select-Object -First 1
+          Get-ChildItem "$($root.FullName)\bin" -Filter '*pkg*config*.exe'
+
+      - name: pkg-config
+        shell: pwsh
+        run: |
+          if (!(Get-Command pkg-config -ErrorAction SilentlyContinue)) { choco install pkgconfiglite -y --no-progress }
+          pkg-config --modversion gstreamer-1.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Сборка
+        shell: pwsh
+        env:
+          HYST_CAST_SERVER: ${{ secrets.HYST_CAST_SERVER }}
+          HYST_CAST_FP: ${{ secrets.HYST_CAST_FP }}
+          HYST_CAST_TOKEN: ${{ secrets.HYST_CAST_TOKEN }}
+        run: cargo build --release --locked -p hyst-cast -p hyst-cast-server
+
+      - name: Упаковка
+        shell: pwsh
+        run: |
+          pip install pefile --quiet
+          python scripts/bundle_windows.py target/release/hyst-cast.exe $env:GSTREAMER_ROOT dist/hyst-cast
+          Copy-Item scripts/README-windows.txt dist/hyst-cast/README.txt
+          Compress-Archive -Path dist/hyst-cast -DestinationPath dist/hyst-cast-windows.zip -Force
+          "{0:N1} МБ zip" -f ((Get-Item dist/hyst-cast-windows.zip).Length / 1MB)
+
+      - name: Самопроверка из zip в чистом окружении (без установленного GStreamer)
+        shell: pwsh
+        run: |
+          Expand-Archive dist/hyst-cast-windows.zip -DestinationPath clean -Force
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          Remove-Item Env:GSTREAMER_ROOT, Env:PKG_CONFIG_PATH -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force srv | Out-Null
+          $env:HYST_CAST_TOKEN = "ci"
+          $env:HYST_CAST_PORT = "4499"
+          $env:HYST_CAST_DATA = "srv"
+          $server = Start-Process target/release/hyst-cast-server.exe -PassThru -RedirectStandardError srv-log.txt
+          Start-Sleep 2
+          "=== probe"
+          & clean/hyst-cast/hyst-cast.exe --probe 2>&1 | Out-String
+          "=== selftest"
+          & clean/hyst-cast/hyst-cast.exe --selftest --server 127.0.0.1:4499 --cert srv/cert.der --token ci --seconds 10 --report report.json 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Stop-Process $server -ErrorAction SilentlyContinue
+          "=== сервер"; Get-Content srv-log.txt
+          if ($code -ne 0) { throw "самопроверка не прошла" }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hyst-cast-windows
+          path: |
+            dist/hyst-cast-windows.zip
+            report.json
+          if-no-files-found: warn
