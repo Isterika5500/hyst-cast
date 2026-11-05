@@ -93,13 +93,14 @@ impl Config {
             .and_then(|s| toml::from_str(&s).ok())
             .unwrap_or_default();
         // Пустые поля сервера — из server.toml рядом с exe, иначе вшитые при сборке
-        let mut d = Config::default();
         let f = server_file();
         if !f.server.is_empty() {
-            d.server = f.server;
-            d.fingerprint = f.fingerprint;
-            d.token = f.token;
+            // server.toml из zip главнее: обновил zip — обновился и сервер
+            c.server = f.server;
+            c.fingerprint = f.fingerprint;
+            c.token = f.token;
         }
+        let d = Config::default();
         if c.server.is_empty() {
             c.server = d.server;
         }
