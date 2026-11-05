@@ -46,7 +46,13 @@ pub fn audio_desc(test: bool) -> String {
         return "audiotestsrc is-live=true wave=sine freq=440 volume=0.3".into();
     }
     #[cfg(windows)]
-    return "wasapi2src loopback=true low-latency=true".into();
+    {
+        // wasapi2 есть только в MSVC-сборке GStreamer; в mingw-сборке — старый wasapi, он тоже умеет loopback
+        if gstreamer::ElementFactory::find("wasapi2src").is_some() {
+            return "wasapi2src loopback=true low-latency=true".into();
+        }
+        return "wasapisrc loopback=true low-latency=true".into();
+    }
     #[cfg(not(windows))]
     return "pulsesrc device=@DEFAULT_MONITOR@ do-timestamp=true".into();
 }

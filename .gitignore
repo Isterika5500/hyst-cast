@@ -1,3 +1,4 @@
 target/
-deploy/secrets.env
+deploy/
 *.der
+__pycache__/

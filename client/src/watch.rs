@@ -214,9 +214,9 @@ impl Viewer {
                 st.win_start = Instant::now();
             } else if margin >= 5_000_000 {
                 st.win_min = st.win_min.min(margin);
-                if st.win_start.elapsed() > Duration::from_secs(10) {
+                if st.win_start.elapsed() > Duration::from_secs(5) {
                     // Запас стабильно больше нужного (часы стримера спешат) — догоняем
-                    if st.win_min > self.latency_ns + 300_000_000 {
+                    if st.win_min > self.latency_ns + 150_000_000 {
                         let back = st.win_min - self.latency_ns;
                         st.offset = Some(off - back);
                         self.stats.resyncs.fetch_add(1, Ordering::Relaxed);
