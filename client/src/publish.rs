@@ -168,7 +168,13 @@ pub async fn start(
             }
             Err(e) => {
                 warn!("кодер {} не запустился: {e:#}", enc.factory);
+                // Ошибка в самом захвате (экран/камера) — другие кодеры не помогут
+                let text = format!("{e:#}");
+                let src_failed = ["d3d11screencapturesrc", "pipewiresrc", "mfvideosrc", "v4l2src"].iter().any(|n| text.contains(&format!(":{n}")) || text.contains(&format!("Gst{}", n)));
                 last_err = Some(e);
+                if src_failed {
+                    break;
+                }
             }
         }
     }

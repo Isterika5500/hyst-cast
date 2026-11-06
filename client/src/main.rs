@@ -22,12 +22,14 @@ use std::time::{Duration, Instant};
 fn main() {
     setup_env();
     let args: Vec<String> = std::env::args().collect();
-    let headless = args.iter().any(|a| a == "--selftest" || a == "--probe");
+    let headless = args.iter().any(|a| a == "--selftest" || a == "--probe" || a == "--elements");
     init_logging(headless);
     if let Err(e) = gst::init() {
         fatal(&format!("GStreamer не запустился: {e}"));
     }
-    let r = if args.iter().any(|a| a == "--probe") {
+    let r = if args.iter().any(|a| a == "--elements") {
+        elements(&args)
+    } else if args.iter().any(|a| a == "--probe") {
         probe()
     } else if args.iter().any(|a| a == "--selftest") {
         selftest(&args)
@@ -141,6 +143,23 @@ fn probe() -> Result<()> {
     Ok(())
 }
 
+/// Отладка на чужой машине: есть ли элементы и какие у них свойства.
+///   hyst-cast --elements d3d11screencapturesrc gdiscreencapsrc …
+fn elements(args: &[String]) -> Result<()> {
+    use gst::prelude::*;
+    let names: Vec<&String> = args.iter().skip_while(|a| *a != "--elements").skip(1).collect();
+    for n in names {
+        match gst::ElementFactory::make(n).build() {
+            Ok(el) => {
+                let props: Vec<String> = el.list_properties().iter().map(|p| p.name().to_string()).filter(|p| p != "name" && p != "parent").collect();
+                println!("{n}: {}", props.join(", "));
+            }
+            Err(_) => println!("{n}: НЕТ"),
+        }
+    }
+    Ok(())
+}
+
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
@@ -223,6 +242,17 @@ fn selftest(args: &[String]) -> Result<()> {
     let source = match arg(args, "--source").as_deref() {
         Some("screen") => capture::list_sources().into_iter().next().map(|s| s.0).unwrap_or(capture::Source::Test),
         Some("camera") => capture::cameras().into_iter().next().map(|s| s.0).context("камер не найдено")?,
+        Some("window") => {
+            let want = arg(args, "--window").unwrap_or_default().to_lowercase();
+            capture::list_sources()
+                .into_iter()
+                .find(|s| s.1.starts_with("Окно:") && s.1.to_lowercase().contains(&want))
+                .map(|s| {
+                    println!("      окно: {}", s.1);
+                    s.0
+                })
+                .context("окон не найдено")?
+        }
         _ => capture::Source::Test,
     };
     println!("      источник: {source:?}");

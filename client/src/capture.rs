@@ -284,21 +284,18 @@ pub async fn open(source: &Source, fps: u32, max: (u32, u32), portal_token: Opti
             Ok(Capture { video_desc, size: None, portal_token: token, _portal: Some(session) })
         }
         #[cfg(windows)]
-        Source::Monitor { index } => Ok(Capture {
-            video_desc: format!(
-                "d3d11screencapturesrc monitor-index={index} show-cursor=true ! video/x-raw(memory:D3D11Memory),framerate={fps}/1"
-            ),
-            size: None,
-            portal_token: None,
-        }),
+        Source::Monitor { index } => {
+            // Цепочка способов: DXGI через D3D11 (быстрее всего) → DXGI через D3D12 → WGC (если есть в сборке) →
+            // GDI → DX9. На ноутбуках с двумя видеокартами и некоторых драйверах DXGI не работает.
+            let cands = win::monitor_candidates(*index, fps);
+            Ok(Capture { video_desc: win::pick_capture(&cands)?, size: None, portal_token: None })
+        }
         #[cfg(windows)]
-        Source::Window { hwnd } => Ok(Capture {
-            video_desc: format!(
-                "d3d11screencapturesrc window-handle={hwnd} capture-api=wgc show-cursor=true ! video/x-raw(memory:D3D11Memory),framerate={fps}/1"
-            ),
-            size: None,
-            portal_token: None,
-        }),
+        Source::Window { hwnd } => {
+            // Без WGC окно захватывается как область экрана, где оно стоит (с обрезкой по его рамке)
+            let cands = win::window_candidates(*hwnd, fps)?;
+            Ok(Capture { video_desc: win::pick_capture(&cands)?, size: None, portal_token: None })
+        }
     }
 }
 
@@ -417,6 +414,121 @@ mod win {
             out.push((Source::Window { hwnd: hwnd.0 as u64 }, format!("Окно: {short}")));
         }
         BOOL(1)
+    }
+
+    /// Запускается ли источник захвата: ждём первый кадр до 3 с.
+    pub fn probe_capture(src: &str) -> bool {
+        let Ok(el) = gst::parse::launch(&format!("{src} ! fakesink name=s")) else { return false };
+        let Ok(p) = el.downcast::<gst::Pipeline>() else { return false };
+        let got = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(pad) = p.by_name("s").and_then(|s| s.static_pad("sink")) {
+            let g = got.clone();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                g.store(true, std::sync::atomic::Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+        }
+        let ok = if p.set_state(gst::State::Playing).is_err() {
+            false
+        } else {
+            let bus = p.bus().unwrap();
+            let t = std::time::Instant::now();
+            loop {
+                if got.load(std::sync::atomic::Ordering::Relaxed) {
+                    break true;
+                }
+                if t.elapsed() > std::time::Duration::from_secs(3) {
+                    break false;
+                }
+                if let Some(m) = bus.timed_pop_filtered(gst::ClockTime::from_mseconds(50), &[gst::MessageType::Error]) {
+                    if let gst::MessageView::Error(e) = m.view() {
+                        tracing::warn!("проверка захвата: {}", e.error());
+                    }
+                    break false;
+                }
+            }
+        };
+        let _ = p.set_state(gst::State::Null);
+        ok
+    }
+
+    fn has_prop(factory: &str, prop: &str) -> bool {
+        gst::ElementFactory::make(factory).build().ok().is_some_and(|e| e.find_property(prop).is_some())
+    }
+
+    /// Способы захвата монитора по убыванию предпочтения: (имя, описание конвейера).
+    pub fn monitor_candidates(index: i32, fps: u32) -> Vec<(&'static str, String)> {
+        let d3d11 = format!("video/x-raw(memory:D3D11Memory),framerate={fps}/1");
+        let mut v = Vec::new();
+        let force = std::env::var("HYST_CAST_CAPTURE_API").unwrap_or_default();
+        if force.is_empty() || force == "dxgi" {
+            v.push(("DXGI (D3D11)", format!("d3d11screencapturesrc monitor-index={index} show-cursor=true ! {d3d11}")));
+        }
+        if force.is_empty() || force == "d3d12" {
+            if gst::ElementFactory::find("d3d12screencapturesrc").is_some() && gst::ElementFactory::find("d3d12download").is_some() {
+                v.push(("DXGI (D3D12)", format!("d3d12screencapturesrc monitor-index={index} show-cursor=true ! video/x-raw(memory:D3D12Memory),framerate={fps}/1 ! d3d12download")));
+            }
+        }
+        if (force.is_empty() || force == "wgc") && has_prop("d3d11screencapturesrc", "capture-api") {
+            v.push(("WGC", format!("d3d11screencapturesrc monitor-index={index} show-cursor=true capture-api=wgc{} ! {d3d11}", wgc_border_off())));
+        }
+        if force.is_empty() || force == "gdi" {
+            v.push(("GDI", format!("gdiscreencapsrc monitor={index} cursor=true ! video/x-raw,framerate={fps}/1")));
+            v.push(("DX9", format!("dx9screencapsrc monitor={index} cursor=true ! video/x-raw,framerate={fps}/1")));
+        }
+        v
+    }
+
+    /// Способы захвата окна: WGC (если есть), иначе область экрана с окном (DXGI с обрезкой, GDI).
+    pub fn window_candidates(hwnd: u64, fps: u32) -> anyhow::Result<Vec<(&'static str, String)>> {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+        let h = HWND(hwnd as *mut _);
+        let mut v = Vec::new();
+        let d3d11 = format!("video/x-raw(memory:D3D11Memory),framerate={fps}/1");
+        if has_prop("d3d11screencapturesrc", "window-handle") && has_prop("d3d11screencapturesrc", "capture-api") {
+            v.push(("WGC (окно)", format!("d3d11screencapturesrc window-handle={hwnd} capture-api=wgc show-cursor=true{} ! {d3d11}", wgc_border_off())));
+        }
+        // Рамка окна без невидимых теней Windows 10/11 и монитор, на котором оно стоит
+        let mut r = RECT::default();
+        unsafe {
+            if DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &mut r as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32).is_err() {
+                let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(h, &mut r);
+            }
+        }
+        let hmon = unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) };
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        anyhow::ensure!(unsafe { GetMonitorInfoW(hmon, &mut mi) }.as_bool(), "не удалось узнать монитор окна");
+        let m = mi.rcMonitor;
+        // Пересечение окна с монитором, в координатах монитора, чётные размеры
+        let (l, t) = (r.left.max(m.left), r.top.max(m.top));
+        let (rr, b) = (r.right.min(m.right), r.bottom.min(m.bottom));
+        anyhow::ensure!(rr - l >= 64 && b - t >= 64, "окно свёрнуто или за пределами экрана — разверни его");
+        let (cx, cy, cw, ch) = (l - m.left, t - m.top, ((rr - l) & !1), ((b - t) & !1));
+        let hm = hmon.0 as u64;
+        v.push(("DXGI (область окна)", format!("d3d11screencapturesrc monitor-handle={hm} show-cursor=true crop-x={cx} crop-y={cy} crop-width={cw} crop-height={ch} ! {d3d11}")));
+        // GDI берёт координаты рабочего стола целиком
+        v.push(("GDI (область окна)", format!("gdiscreencapsrc x={l} y={t} width={cw} height={ch} cursor=true ! video/x-raw,framerate={fps}/1")));
+        Ok(v)
+    }
+
+    /// Первый способ захвата, который реально выдаёт кадры.
+    pub fn pick_capture(cands: &[(&'static str, String)]) -> anyhow::Result<String> {
+        for (name, desc) in cands {
+            if probe_capture(desc) {
+                tracing::info!("захват: {name} — {desc}");
+                return Ok(desc.clone());
+            }
+            tracing::warn!("захват {name} не работает на этом компьютере");
+        }
+        anyhow::bail!("Windows не даёт захватить экран: не сработал ни один способ ({})", cands.iter().map(|c| c.0).collect::<Vec<_>>().join(", "))
+    }
+
+    /// Убрать жёлтую рамку захвата WGC (Windows 11 умеет), если элемент это поддерживает.
+    pub fn wgc_border_off() -> &'static str {
+        let has = gst::ElementFactory::make("d3d11screencapturesrc").build().ok().is_some_and(|e| e.find_property("show-border").is_some());
+        if has { " show-border=false" } else { "" }
     }
 
     /// Процесс, которому принадлежит окно.
