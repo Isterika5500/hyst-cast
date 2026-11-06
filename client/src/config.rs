@@ -47,6 +47,10 @@ pub struct Config {
     pub portal_token: Option<String>,
     /// Заходить в комнату сразу при запуске (сбрасывается кнопкой «Выйти»).
     pub auto_join: bool,
+    /// Всплывающие уведомления «зашёл/вышел/начал стрим».
+    pub notify: bool,
+    /// Громкость каждого друга (по имени), запоминается между запусками.
+    pub volumes: std::collections::BTreeMap<String, f32>,
 }
 
 impl Default for Config {
@@ -63,6 +67,8 @@ impl Default for Config {
             encoder: String::new(),
             portal_token: None,
             auto_join: false,
+            notify: true,
+            volumes: Default::default(),
         }
     }
 }

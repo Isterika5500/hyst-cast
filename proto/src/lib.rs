@@ -48,7 +48,15 @@ pub enum ClientMsg {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "t")]
 pub enum ServerMsg {
-    Welcome { id: u32, peers: Vec<PeerInfo>, max_peers: u32 },
+    /// `name` — имя, под которым тебя видят (сервер добавляет номер к повторяющимся). Необязательное
+    /// поле: старые версии клиента его просто не читают.
+    Welcome {
+        id: u32,
+        peers: Vec<PeerInfo>,
+        max_peers: u32,
+        #[serde(default)]
+        name: String,
+    },
     Error { message: String },
     PeerJoined { peer: PeerInfo },
     PeerLeft { id: u32 },

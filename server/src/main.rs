@@ -226,7 +226,7 @@ async fn handle_conn(state: Arc<State>, conn: quinn::Connection) -> Result<()> {
             .iter()
             .map(|(pid, p)| PeerInfo { id: *pid, name: p.name.clone(), stream: p.stream.clone() })
             .collect();
-        let _ = ctl_tx.send(ServerMsg::Welcome { id, peers, max_peers: state.max_peers });
+        let _ = ctl_tx.send(ServerMsg::Welcome { id, peers, max_peers: state.max_peers, name: name.clone() });
         r.peers.insert(
             id,
             Peer {

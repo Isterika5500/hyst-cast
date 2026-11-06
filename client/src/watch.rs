@@ -45,6 +45,34 @@ impl FrameSlot {
     }
 }
 
+/// Подключить appsink к слоту кадров: копируем в плотный RGBA (у кадра бывает выравнивание строк)
+/// и будим интерфейс. Используется и зрителем, и превью у стримера.
+pub fn attach_frame_sink(sink: &gst_app::AppSink, slot: Arc<FrameSlot>) {
+    sink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |s| {
+                let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let (Some(buf), Some(caps)) = (sample.buffer(), sample.caps()) else { return Ok(gst::FlowSuccess::Ok) };
+                let Ok(info) = gstreamer_video::VideoInfo::from_caps(caps) else { return Ok(gst::FlowSuccess::Ok) };
+                let Ok(vf) = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buf, &info) else { return Ok(gst::FlowSuccess::Ok) };
+                let (w, h) = (info.width(), info.height());
+                use gstreamer_video::prelude::VideoFrameExt;
+                let stride = vf.plane_stride()[0] as usize;
+                let Ok(src) = vf.plane_data(0) else { return Ok(gst::FlowSuccess::Ok) };
+                let row = w as usize * 4;
+                let mut rgba = Vec::with_capacity(row * h as usize);
+                for y in 0..h as usize {
+                    rgba.extend_from_slice(&src[y * stride..y * stride + row]);
+                }
+                *slot.frame.lock().unwrap() = Some(Frame { w, h, rgba });
+                slot.seq.fetch_add(1, Ordering::Relaxed);
+                (slot.repaint)();
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+}
+
 /// Размер для показа в окне: не больше 1920×1080 с сохранением пропорций, чётный.
 pub fn display_size(w: u32, h: u32) -> (u32, u32) {
     let k = (1920.0 / w.max(1) as f64).min(1080.0 / h.max(1) as f64).min(1.0);
@@ -169,32 +197,10 @@ impl Viewer {
         stats.latency_ms.store(-1, Ordering::Relaxed);
         let offset_pub = Arc::new(AtomicI64::new(i64::MIN));
 
-        // Кадры в окно приложения: копируем в плотный RGBA (у кадра бывает выравнивание строк) и будим интерфейс
+        // Кадры в окно приложения
         if let (Some(slot), Some(out)) = (slot, pipeline.by_name("vout")) {
             if let Ok(sink) = out.downcast::<gst_app::AppSink>() {
-                sink.set_callbacks(
-                    gst_app::AppSinkCallbacks::builder()
-                        .new_sample(move |s| {
-                            let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                            let (Some(buf), Some(caps)) = (sample.buffer(), sample.caps()) else { return Ok(gst::FlowSuccess::Ok) };
-                            let Ok(info) = gstreamer_video::VideoInfo::from_caps(caps) else { return Ok(gst::FlowSuccess::Ok) };
-                            let Ok(vf) = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buf, &info) else { return Ok(gst::FlowSuccess::Ok) };
-                            let (w, h) = (info.width(), info.height());
-                            use gstreamer_video::prelude::VideoFrameExt;
-                            let stride = vf.plane_stride()[0] as usize;
-                            let Ok(src) = vf.plane_data(0) else { return Ok(gst::FlowSuccess::Ok) };
-                            let row = w as usize * 4;
-                            let mut rgba = Vec::with_capacity(row * h as usize);
-                            for y in 0..h as usize {
-                                rgba.extend_from_slice(&src[y * stride..y * stride + row]);
-                            }
-                            *slot.frame.lock().unwrap() = Some(Frame { w, h, rgba });
-                            slot.seq.fetch_add(1, Ordering::Relaxed);
-                            (slot.repaint)();
-                            Ok(gst::FlowSuccess::Ok)
-                        })
-                        .build(),
-                );
+                attach_frame_sink(&sink, slot);
             }
         }
         if let Some(out) = pipeline.by_name("vout") {

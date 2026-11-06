@@ -101,6 +101,7 @@ pub async fn start(
     portal_token: Option<String>,
     tx: mpsc::Sender<Out>,
     link: Arc<Link>,
+    preview: Option<Arc<crate::watch::FrameSlot>>,
 ) -> Result<Publisher> {
     let capture = capture::open(&source, preset.fps, (preset.width, preset.height), portal_token).await?;
     let akind = if source == Source::Test && std::env::var("HYST_CAST_SYSTEM_AUDIO").is_ok() {
@@ -146,7 +147,18 @@ pub async fn start(
         let e2 = enc.clone();
         let link = link.clone();
         let ad = audio_ok.as_ref().map(|a| a.0.clone());
-        let r = tokio::task::spawn_blocking(move || try_start(&vd, &e2, preset, ad, tx, link)).await?;
+        let pv = preview.clone();
+        let r = tokio::task::spawn_blocking(move || {
+            // Сначала с превью для себя; если на этом железе ветка превью не заводится — без него
+            match try_start(&vd, &e2, preset, ad.clone(), tx.clone(), link.clone(), pv.clone()) {
+                Err(e) if pv.is_some() => {
+                    warn!("превью не завелось ({e:#}) — стрим без превью");
+                    try_start(&vd, &e2, preset, ad, tx, link, None)
+                }
+                r => r,
+            }
+        })
+        .await?;
         match r {
             Ok(mut p) => {
                 p.portal_token = capture.portal_token.clone();
@@ -201,13 +213,31 @@ pub fn probe_audio(desc: &str) -> bool {
     ok
 }
 
-fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio_desc: Option<String>, tx: mpsc::Sender<Out>, link: Arc<Link>) -> Result<Publisher> {
+fn try_start(
+    video_desc: &str,
+    encoder: &Encoder,
+    preset: Preset,
+    audio_desc: Option<String>,
+    tx: mpsc::Sender<Out>,
+    link: Arc<Link>,
+    preview: Option<Arc<crate::watch::FrameSlot>>,
+) -> Result<Publisher> {
     let audio = audio_desc.is_some();
+    // С превью: после масштабирования tee — одна ветка в кодер, вторая — маленький RGBA для своего окна
+    let tee = if preview.is_some() { "tee name=pt ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 ! " } else { "" };
     let mut desc = format!(
-        "{video_desc} ! queue max-size-buffers=3 max-size-time=0 max-size-bytes=0 leaky=downstream ! {} ! {} name=enc ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=vsink sync=false max-buffers=8",
+        "{video_desc} ! queue max-size-buffers=3 max-size-time=0 max-size-bytes=0 leaky=downstream ! {} ! {tee}{} name=enc ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=vsink sync=false max-buffers=8",
         encoder.convert_desc(preset.width, preset.height, video_desc.contains("D3D11Memory")),
         encoder.factory
     );
+    if preview.is_some() {
+        let pw = 640u32;
+        let ph = ((pw as f64 * preset.height as f64 / preset.width as f64) as u32) & !1;
+        desc.push_str(&format!(
+            " pt. ! queue leaky=downstream max-size-buffers=1 max-size-time=0 max-size-bytes=0 ! videorate drop-only=true max-rate=15 ! {} ! appsink name=pview sync=false max-buffers=1 drop=true",
+            encoder.preview_desc(pw, ph)
+        ));
+    }
     if audio {
         desc.push_str(&format!(
             " {} ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=128000 frame-size=20 audio-type=generic ! appsink name=asink sync=false max-buffers=50",
@@ -222,6 +252,11 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio_desc: Op
     info!("конвейер стрима: {desc}");
     let pipeline = gst::parse::launch(&desc)?.downcast::<gst::Pipeline>().map_err(|_| anyhow::anyhow!("не конвейер"))?;
     let enc = pipeline.by_name("enc").context("нет кодера")?;
+    if let (Some(slot), Some(pv)) = (preview, pipeline.by_name("pview")) {
+        if let Ok(sink) = pv.downcast::<gst_app::AppSink>() {
+            crate::watch::attach_frame_sink(&sink, slot);
+        }
+    }
     encoder.configure(&enc, preset.kbps, preset.fps);
 
     let shared = Arc::new(Shared {

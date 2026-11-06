@@ -271,6 +271,24 @@ fn small_button(ui: &mut egui::Ui, text: &str, fill: Color32) -> bool {
     resp.clicked()
 }
 
+/// Кнопка-шестерёнка (рисуем сами — в шрифтах значка нет).
+fn gear_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(8), SURFACE_HI);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let c = rect.center();
+    let col = if resp.hovered() { TEXT } else { TEXT2 };
+    for i in 0..8 {
+        let a = i as f32 * std::f32::consts::TAU / 8.0;
+        let d = Vec2::new(a.cos(), a.sin());
+        ui.painter().line_segment([c + d * 5.5, c + d * 8.5], Stroke::new(3.0, col));
+    }
+    ui.painter().circle_stroke(c, 5.5, Stroke::new(2.2, col));
+    resp
+}
+
 /// Кнопка с нарисованной иконкой «обновить» (в шрифтах нужного символа нет).
 fn refresh_button(ui: &mut egui::Ui) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
@@ -401,6 +419,7 @@ pub struct App {
     fullscreen: bool,
     /// Последний отправленный размер видео по id.
     sent_size: HashMap<u32, (u32, u32)>,
+    settings_open: bool,
 }
 
 const QUALITY: &[(&str, &str)] = &[("720p30", "720p"), ("720p60", "720p60"), ("1080p30", "1080p"), ("1080p60", "1080p60"), ("1440p60", "1440p")];
@@ -427,6 +446,7 @@ impl App {
             focus_at: std::time::Instant::now(),
             fullscreen: false,
             sent_size: HashMap::new(),
+            settings_open: false,
         }
     }
 
@@ -518,9 +538,10 @@ impl App {
     // -------------------------------------------------------------- боковая панель
 
     fn sidebar(&mut self, ui: &mut egui::Ui, rtt: Option<u32>) {
-        let (peers, publishing) = {
+        let (peers, publishing, me) = {
             let s = self.shared.lock().unwrap();
-            (s.peers.clone(), s.publishing.is_some())
+            let me = if s.my_name.is_empty() { self.cfg.name.clone() } else { s.my_name.clone() };
+            (s.peers.clone(), s.publishing.is_some(), me)
         };
         ui.add_space(14.0);
         ui.horizontal(|ui| {
@@ -542,7 +563,7 @@ impl App {
 
         egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(ui.available_height() - 76.0).show(ui, |ui| {
             let me_sub = if publishing { "в эфире".to_string() } else { "в сети".to_string() };
-            self.member_row(ui, &format!("{} (ты)", self.cfg.name), &self.cfg.name.clone(), &me_sub, publishing, false);
+            self.member_row(ui, &format!("{me} (ты)"), &me, &me_sub, publishing, false);
             for p in peers.values() {
                 let sub = match (&p.stream, p.watching) {
                     (Some(s), true) => format!("смотришь · {}p{}", s.height, s.fps),
@@ -557,10 +578,10 @@ impl App {
         let bottom = Rect::from_min_max(Pos2::new(ui.max_rect().left() - 12.0, ui.max_rect().bottom() - 64.0), Pos2::new(ui.max_rect().right() + 12.0, ui.max_rect().bottom() + 12.0));
         ui.painter().rect_filled(bottom, CornerRadius::ZERO, Color32::from_rgb(0x19, 0x19, 0x1C));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bottom.shrink2(Vec2::new(14.0, 12.0))).layout(Layout::left_to_right(Align::Center)));
-        avatar(&mut child, &self.cfg.name, 34.0, false);
+        avatar(&mut child, &me, 34.0, false);
         child.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
-            ui.label(RichText::new(&self.cfg.name).font(FontId::new(14.0, semibold())));
+            ui.label(RichText::new(&me).font(FontId::new(14.0, semibold())));
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
                 ui.painter().circle_filled(r.center(), 4.0, GREEN);
@@ -569,11 +590,10 @@ impl App {
             });
         });
         child.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.add(egui::Button::new(RichText::new("Выйти").size(12.5).color(TEXT2)).fill(Color32::TRANSPARENT)).on_hover_text("Отключиться от комнаты").clicked() {
-                self.cfg.auto_join = false;
-                self.cfg.save();
-                let _ = self.tx.send(Cmd::Disconnect);
+            if gear_button(ui).on_hover_text("Настройки").clicked() {
+                self.settings_open = !self.settings_open;
             }
+
         });
     }
 
@@ -597,9 +617,9 @@ impl App {
     // -------------------------------------------------------------- сцена
 
     fn stage(&mut self, ui: &mut egui::Ui) {
-        let (peers, watch, frames) = {
+        let (peers, watch, frames, my_id, mine) = {
             let s = self.shared.lock().unwrap();
-            (s.peers.clone(), s.watch.clone(), s.frames.clone())
+            (s.peers.clone(), s.watch.clone(), s.frames.clone(), s.my_id, s.publishing.clone())
         };
         let live: Vec<_> = peers.iter().filter(|(_, p)| p.stream.is_some()).collect();
         // Отладка/скриншоты: HYST_CAST_AUTOWATCH=1 — сам открыть первый эфир (=card — без «крупно»)
@@ -633,14 +653,15 @@ impl App {
         ui.add_space(18.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Сейчас в эфире").font(FontId::new(22.0, bold())));
-            if !live.is_empty() {
+            let total = live.len() + mine.is_some() as usize;
+            if total > 0 {
                 ui.add_space(4.0);
-                pill(ui, &live.len().to_string(), SURFACE_HI, TEXT2);
+                pill(ui, &total.to_string(), SURFACE_HI, TEXT2);
             }
         });
         ui.add_space(12.0);
 
-        if live.is_empty() {
+        if live.is_empty() && mine.is_none() {
             let avail = ui.available_rect_before_wrap();
             ui.scope_builder(egui::UiBuilder::new().max_rect(avail), |ui| {
                 ui.add_space((avail.height() / 2.0 - 90.0).max(10.0));
@@ -659,13 +680,27 @@ impl App {
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let gap = 14.0;
-            let cols = if live.len() > 1 && ui.available_width() > 700.0 { 2 } else { 1 };
+            let total = live.len() + mine.is_some() as usize;
+            let cols = if total > 1 && ui.available_width() > 700.0 { 2 } else { 1 };
             let w = ((ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32).min(if cols == 1 { 780.0 } else { 10_000.0 });
-            for row in live.chunks(cols) {
+            // Плитки: сначала свой эфир (если идёт), потом эфиры друзей
+            let mut tiles: Vec<Option<(u32, &crate::net::PeerView)>> = Vec::new();
+            if mine.is_some() {
+                tiles.push(None);
+            }
+            tiles.extend(live.iter().map(|(id, p)| Some((**id, *p))));
+            for row in tiles.chunks(cols) {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
-                    for (id, p) in row {
-                        ui.allocate_ui(Vec2::new(w, 0.0), |ui| self.stream_card(ui, **id, p, watch.get(id), w, &frames));
+                    for t in row {
+                        match t {
+                            Some((id, p)) => {
+                                ui.allocate_ui(Vec2::new(w, 0.0), |ui| self.stream_card(ui, *id, p, watch.get(id), w, &frames));
+                            }
+                            None => {
+                                ui.allocate_ui(Vec2::new(w, 0.0), |ui| self.own_card(ui, w, &frames, my_id, mine.as_ref().unwrap()));
+                            }
+                        }
                     }
                 });
                 ui.add_space(gap);
@@ -709,6 +744,7 @@ impl App {
                     self.focus_at = std::time::Instant::now();
                 } else {
                     let _ = self.tx.send(Cmd::Watch(id));
+                            if let Some(v) = self.cfg.volumes.get(&p.name) { let _ = self.tx.send(Cmd::Volume(id, *v as f64)); }
                     self.focus = Some(id);
                     self.focus_at = std::time::Instant::now();
                 }
@@ -750,10 +786,12 @@ impl App {
                     if info.has_audio {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Громкость").size(12.5).color(TEXT2));
-                            let vol = self.volumes.entry(id).or_insert(1.0);
+                            let vol = self.volumes.entry(id).or_insert_with(|| *self.cfg.volumes.get(&p.name).unwrap_or(&1.0));
                             ui.spacing_mut().slider_width = (width - 150.0).max(80.0);
                             if ui.add(egui::Slider::new(vol, 0.0..=1.5).show_value(false)).changed() {
                                 let _ = self.tx.send(Cmd::Volume(id, *vol as f64));
+                                self.cfg.volumes.insert(p.name.clone(), *vol);
+                                self.cfg.save();
                             }
                         });
                     }
@@ -768,6 +806,46 @@ impl App {
                     }
                 }
             });
+            });
+        });
+    }
+
+    /// Своя плитка «Ты в эфире»: превью того, что видят друзья.
+    fn own_card(&mut self, ui: &mut egui::Ui, width: f32, frames: &HashMap<u32, Arc<crate::watch::FrameSlot>>, my_id: u32, pv: &crate::net::PubView) {
+        Frame::new().fill(SURFACE).stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xFF, 0x45, 0x3A, 70))).corner_radius(CornerRadius::same(14)).show(ui, |ui| {
+            ui.set_width(width);
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(width, width * 9.0 / 16.0), Sense::hover());
+                let top = CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 };
+                ui.painter().rect_filled(rect, top, Color32::BLACK);
+                match video_texture(ui.ctx(), &mut self.textures, frames, my_id) {
+                    Some(tex) => paint_fit(ui.painter(), rect, &tex),
+                    None => {
+                        ui.painter().text(rect.center(), Align2::CENTER_CENTER, "запуск превью…", FontId::new(13.0, semibold()), TEXT3);
+                    }
+                }
+                paint_pill(ui.painter(), rect.left_top() + Vec2::new(12.0, 12.0), "● ТЫ В ЭФИРЕ", LIVE, Color32::WHITE);
+                if let Some(i) = &pv.info {
+                    let q = format!("{}p · {} fps", i.height, i.fps);
+                    let qg = ui.painter().layout_no_wrap(q.clone(), FontId::new(11.0, bold()), Color32::WHITE);
+                    paint_pill(ui.painter(), rect.right_top() + Vec2::new(-12.0 - qg.size().x - 14.0, 12.0), &q, Color32::from_black_alpha(140), Color32::WHITE);
+                }
+                Frame::new().inner_margin(Margin::same(14)).show(ui, |ui| {
+                    ui.set_width(width - 28.0);
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(Vec2::new((ui.available_width() - 130.0).max(60.0), 38.0), Layout::top_down(Align::Min), |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let who = if pv.viewers.is_empty() { "пока никто не смотрит".to_string() } else { format!("смотрят: {}", pv.viewers.join(", ")) };
+                            ui.add(egui::Label::new(RichText::new("Так тебя видят друзья").font(FontId::new(15.0, semibold()))).truncate());
+                            ui.add(egui::Label::new(RichText::new(who).size(12.0).color(TEXT3)).truncate());
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if small_button(ui, "Остановить", LIVE) {
+                                let _ = self.tx.send(Cmd::Stop);
+                            }
+                        });
+                    });
+                });
             });
         });
     }
@@ -829,10 +907,12 @@ impl App {
             let has_audio = p.stream.as_ref().is_some_and(|s| s.has_audio);
             if has_audio {
                 child.label(RichText::new("Громкость").size(12.5).color(Color32::from_white_alpha(220)));
-                let vol = self.volumes.entry(id).or_insert(1.0);
+                let vol = self.volumes.entry(id).or_insert_with(|| *self.cfg.volumes.get(&p.name).unwrap_or(&1.0));
                 child.spacing_mut().slider_width = 140.0;
                 if child.add(egui::Slider::new(vol, 0.0..=1.5).show_value(false)).changed() {
                     let _ = self.tx.send(Cmd::Volume(id, *vol as f64));
+                    self.cfg.volumes.insert(p.name.clone(), *vol);
+                    self.cfg.save();
                 }
             }
             child.with_layout(Layout::right_to_left(Align::Max), |ui| {
@@ -981,6 +1061,144 @@ impl App {
         });
     }
 
+    /// Уведомления о событиях комнаты: справа снизу над панелью стрима, гаснут сами через 5 с.
+    fn events(&mut self, ctx: &egui::Context) {
+        let events: Vec<crate::net::Event> = {
+            let mut s = self.shared.lock().unwrap();
+            s.events.retain(|e| e.at.elapsed().as_secs_f32() < 5.0);
+            s.events.clone()
+        };
+        if events.is_empty() {
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        egui::Area::new(egui::Id::new("events")).anchor(Align2::RIGHT_BOTTOM, Vec2::new(-20.0, -150.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            for e in events.iter().rev() {
+                let age = e.at.elapsed().as_secs_f32();
+                // Плавное появление и исчезновение
+                let alpha = (age / 0.25).min(1.0) * ((5.0 - age) / 0.6).clamp(0.0, 1.0);
+                let fill = Color32::from_rgb(0x2C, 0x2C, 0x31).gamma_multiply(alpha);
+                Frame::new()
+                    .fill(fill)
+                    .stroke(Stroke::new(1.0, Color32::from_white_alpha((16.0 * alpha) as u8)))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::symmetric(12, 9))
+                    .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha((100.0 * alpha) as u8) })
+                    .show(ui, |ui| {
+                        ui.set_min_width(300.0);
+                        ui.set_max_width(360.0);
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                            ui.painter().circle_filled(r.center(), 4.0, if e.live.is_some() { LIVE } else { ACCENT_HI }.gamma_multiply(alpha));
+                            ui.label(RichText::new(&e.text).size(13.0).color(TEXT.gamma_multiply(alpha)));
+                            if let Some(id) = e.live {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Смотреть", ACCENT.gamma_multiply(alpha)) {
+                                        let _ = self.tx.send(Cmd::Watch(id));
+                                        self.focus = Some(id);
+                                        self.focus_at = std::time::Instant::now();
+                                    }
+                                });
+                            }
+                        });
+                    });
+            }
+        });
+    }
+
+    /// Окно настроек.
+    fn settings(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        // Затемнение фона
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::new("dim")).order(egui::Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
+            let r = ui.allocate_rect(screen, Sense::click());
+            ui.painter().rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(140));
+            if r.clicked() {
+                self.settings_open = false;
+            }
+        });
+        let mut open = true;
+        egui::Window::new(RichText::new("Настройки").font(FontId::new(18.0, bold())))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size(Vec2::new(460.0, 0.0))
+            .order(egui::Order::Foreground)
+            .frame(Frame::new().fill(SURFACE).stroke(hairline()).corner_radius(CornerRadius::same(16)).inner_margin(Margin::same(22)).shadow(egui::Shadow { offset: [0, 12], blur: 40, spread: 0, color: Color32::from_black_alpha(140) }))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                caption(ui, "Просмотр");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Буфер").color(TEXT2));
+                    ui.add(egui::Slider::new(&mut self.cfg.latency_ms, 80..=800).suffix(" мс"));
+                });
+                ui.label(RichText::new("Меньше — меньше задержка; больше — плавнее на плохом интернете. Действует со следующего просмотра.").size(11.5).color(TEXT3));
+                ui.add_space(10.0);
+
+                caption(ui, "Стрим");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Кодер").color(TEXT2));
+                    let list = crate::codecs::cached_encoders().unwrap_or_default();
+                    let mut names: Vec<(String, String)> = Vec::new();
+                    for e in &list {
+                        if !names.iter().any(|n| n.0 == e.factory) {
+                            names.push((e.factory.clone(), e.label()));
+                        }
+                    }
+                    let cur = if self.cfg.encoder.is_empty() { "Автоматически (лучший)".to_string() } else { self.cfg.encoder.clone() };
+                    egui::ComboBox::from_id_salt("enc").width(260.0).selected_text(cur).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.cfg.encoder, String::new(), "Автоматически (лучший)");
+                        for (f, label) in &names {
+                            ui.selectable_value(&mut self.cfg.encoder, f.clone(), label);
+                        }
+                    });
+                });
+                ui.label(RichText::new("GPU — видеокарта (почти не грузит процессор), CPU — процессор (x264 даёт лучшее качество, но нагружает).").size(11.5).color(TEXT3));
+                ui.add_space(10.0);
+
+                caption(ui, "Уведомления");
+                ui.horizontal(|ui| {
+                    toggle(ui, &mut self.cfg.notify);
+                    ui.label("Показывать, кто зашёл, вышел и начал стрим");
+                });
+                ui.add_space(10.0);
+
+                ui.collapsing(RichText::new("Сервер").color(TEXT2), |ui| {
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        field(ui, "Адрес", &mut self.cfg.server, "host:4433", false);
+                        field(ui, "Отпечаток", &mut self.cfg.fingerprint, "sha256", false);
+                        field(ui, "Пароль", &mut self.cfg.token, "", true);
+                        ui.label(RichText::new("Меняется после выхода и нового входа в комнату.").size(11.5).color(TEXT3));
+                    });
+                });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if small_button(ui, "Выйти из комнаты", Color32::from_rgb(0x4A, 0x24, 0x24)) {
+                        self.cfg.auto_join = false;
+                        self.cfg.save();
+                        self.settings_open = false;
+                        let _ = self.tx.send(Cmd::Disconnect);
+                    }
+                    ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).size(11.5).color(TEXT3));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if small_button(ui, "Готово", ACCENT) {
+                            self.cfg.save();
+                            self.settings_open = false;
+                        }
+                    });
+                });
+            });
+        if !open {
+            self.cfg.save();
+            self.settings_open = false;
+        }
+    }
+
     fn toast(&mut self, ctx: &egui::Context, notice: Option<String>) {
         let Some(n) = notice else { return };
         if self.notice_dismissed.as_deref() == Some(n.as_str()) {
@@ -1050,6 +1268,25 @@ impl eframe::App for App {
             egui::CentralPanel::default().frame(Frame::new().fill(BG)).show(ui, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.login(ui, &status));
             });
+        }
+        if status == Status::Online && !self.fullscreen && self.cfg.notify {
+            self.events(&ctx);
+        }
+        // Отладка/скриншоты: HYST_CAST_AUTOSTART=1 — сам начать тестовый стрим, HYST_CAST_OPEN_SETTINGS=1 — открыть настройки
+        if status == Status::Online && std::env::var("HYST_CAST_AUTOSTART").is_ok() {
+            let need = { let s = self.shared.lock().unwrap(); s.publishing.is_none() && !s.starting };
+            if need && self.textures.is_empty() {
+                // SAFETY: однократно, до запуска фоновых потоков, читающих эту переменную
+                unsafe { std::env::remove_var("HYST_CAST_AUTOSTART") };
+                let _ = self.tx.send(Cmd::Start { source: Source::Test, preset: config::preset("1080p30"), audio: true, encoder: String::new(), portal_token: None });
+            }
+        }
+        if status == Status::Online && std::env::var("HYST_CAST_OPEN_SETTINGS").is_ok() {
+            unsafe { std::env::remove_var("HYST_CAST_OPEN_SETTINGS") };
+            self.settings_open = true;
+        }
+        if status == Status::Online {
+            self.settings(&ctx);
         }
         self.toast(&ctx, notice);
     }

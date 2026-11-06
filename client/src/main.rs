@@ -95,7 +95,8 @@ fn run_gui() -> Result<()> {
             .with_title("hyst-cast")
             .with_app_id("hyst-cast")
             .with_inner_size([1040.0, 680.0])
-            .with_min_inner_size([760.0, 520.0]),
+            .with_min_inner_size([760.0, 520.0])
+            .with_icon(eframe::egui::IconData { rgba: include_bytes!("../assets/icon-256.rgba").to_vec(), width: 256, height: 256 }),
         ..Default::default()
     };
     eframe::run_native(

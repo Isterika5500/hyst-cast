@@ -61,9 +61,20 @@ pub struct WatchStats {
     pub decoder: String,
 }
 
+/// Событие для всплывающего уведомления.
+#[derive(Clone, Debug)]
+pub struct Event {
+    pub at: Instant,
+    pub text: String,
+    /// Если это «начал стрим» — id стримера (для кнопки «Смотреть»).
+    pub live: Option<u32>,
+}
+
 pub struct Shared {
     pub status: Status,
     pub my_id: u32,
+    /// Имя, под которым тебя видят в комнате (может отличаться: «Вася 2»).
+    pub my_name: String,
     pub peers: BTreeMap<u32, PeerView>,
     pub starting: bool,
     pub publishing: Option<PubView>,
@@ -72,6 +83,8 @@ pub struct Shared {
     pub notice: Option<String>,
     /// Новый токен портала — интерфейс сохранит его в настройки.
     pub portal_token: Option<String>,
+    /// Последние события комнаты (для уведомлений).
+    pub events: Vec<Event>,
     /// Кадры стримов для показа в окне (режим Embedded).
     pub frames: HashMap<u32, Arc<crate::watch::FrameSlot>>,
 }
@@ -81,6 +94,7 @@ impl Default for Shared {
         Shared {
             status: Status::Offline,
             my_id: 0,
+            my_name: String::new(),
             peers: BTreeMap::new(),
             starting: false,
             publishing: None,
@@ -89,6 +103,7 @@ impl Default for Shared {
             notice: None,
             portal_token: None,
             frames: HashMap::new(),
+            events: Vec::new(),
         }
     }
 }
@@ -199,6 +214,13 @@ fn set(shared: &SharedRef, repaint: &Repaint, f: impl FnOnce(&mut Shared)) {
     repaint();
 }
 
+fn push_event(s: &mut Shared, text: String, live: Option<u32>) {
+    s.events.push(Event { at: Instant::now(), text, live });
+    if s.events.len() > 6 {
+        s.events.remove(0);
+    }
+}
+
 fn reset(shared: &SharedRef) {
     let mut s = shared.lock().unwrap();
     s.peers.clear();
@@ -256,10 +278,11 @@ async fn session(
     write_msg(&mut send, &ClientMsg::Hello { version: PROTOCOL_VERSION, token: cfg.token.clone(), name: cfg.name.clone(), room: cfg.room.clone() }).await?;
     let first: ServerMsg = read_msg(&mut recv).await?.context("сервер закрыл соединение")?;
     let my_id = match first {
-        ServerMsg::Welcome { id, peers, .. } => {
+        ServerMsg::Welcome { id, peers, name, .. } => {
             let mut s = shared.lock().unwrap();
             s.status = Status::Online;
             s.my_id = id;
+            s.my_name = if name.is_empty() { cfg.name.clone() } else { name };
             s.peers = peers.into_iter().map(|p| (p.id, PeerView { name: p.name, stream: p.stream, watching: false, stats: String::new() })).collect();
             s.notice = None;
             id
@@ -353,8 +376,12 @@ async fn session(
                     let st = start_tx.clone();
                     let conn2 = conn.clone();
                     let link = Arc::new(publish::Link::default());
+                    let preview = (mode == SinkMode::Embedded).then(|| crate::watch::FrameSlot::new(repaint.clone()));
+                    if let Some(pv) = &preview {
+                        shared.lock().unwrap().frames.insert(my_id, pv.clone());
+                    }
                     tokio::spawn(async move {
-                        let r = publish::start(source, preset, audio, encoder, portal_token, ptx, link.clone()).await;
+                        let r = publish::start(source, preset, audio, encoder, portal_token, ptx, link.clone(), preview).await;
                         if let Ok(p) = &r {
                             // отправитель запускается здесь, чтобы не потерять первые кадры
                             tokio::spawn(send_media(conn2, prx, link, p.encoder_element()));
@@ -364,6 +391,7 @@ async fn session(
                 }
                 Some(Cmd::Stop) => {
                     resume.publish = None;
+                    shared.lock().unwrap().frames.remove(&my_id);
                     if publisher.take().is_some() {
                         let _ = ctl_tx.send(ClientMsg::StopStream);
                     }
@@ -407,10 +435,16 @@ async fn session(
             msg = srv_rx.recv() => {
                 let Some(msg) = msg else { break Err(anyhow!("связь с сервером потеряна")) };
                 match msg {
-                    ServerMsg::PeerJoined { peer } => set(shared, repaint, |s| { s.peers.insert(peer.id, PeerView { name: peer.name, stream: peer.stream, watching: false, stats: String::new() }); }),
+                    ServerMsg::PeerJoined { peer } => set(shared, repaint, |s| {
+                        push_event(s, format!("{} зашёл в комнату", peer.name), None);
+                        s.peers.insert(peer.id, PeerView { name: peer.name, stream: peer.stream, watching: false, stats: String::new() });
+                    }),
                     ServerMsg::PeerLeft { id } => {
                         viewers.lock().unwrap().remove(&id);
-                        set(shared, repaint, |s| { s.peers.remove(&id); s.watch.remove(&id); s.frames.remove(&id); });
+                        set(shared, repaint, |s| {
+                            if let Some(p) = s.peers.remove(&id) { push_event(s, format!("{} вышел", p.name), None); }
+                            s.watch.remove(&id); s.frames.remove(&id);
+                        });
                     }
                     ServerMsg::StreamStarted { id, info } => {
                         let watching = viewers.lock().unwrap().contains_key(&id);
@@ -420,7 +454,12 @@ async fn session(
                             let _ = ctl_tx.send(ClientMsg::Unwatch { id });
                         }
                         let name = shared.lock().unwrap().peers.get(&id).map(|p| p.name.clone()).unwrap_or_default();
-                        set(shared, repaint, |s| if let Some(p) = s.peers.get_mut(&id) { p.stream = Some(info.clone()); p.watching = false; });
+                        set(shared, repaint, |s| {
+                            if let Some(p) = s.peers.get_mut(&id) { p.stream = Some(info.clone()); p.watching = false; }
+                            if !watching && !resume.watch.contains(&name) && !name.is_empty() {
+                                push_event(s, format!("{name} начал стрим · {}p{}", info.height, info.fps), Some(id));
+                            }
+                        });
                         // Смотрели этого человека раньше (перезапуск стрима, переподключение) — открываем сами
                         if watching || resume.watch.contains(&name) {
                             self_send(Cmd::Watch(id));
@@ -453,7 +492,7 @@ async fn session(
                         });
                         publisher = Some(p);
                     }
-                    Err(e) => set(shared, repaint, |s| { s.starting = false; s.notice = Some(format!("Стрим не запустился: {e:#}")); }),
+                    Err(e) => set(shared, repaint, |s| { s.starting = false; s.frames.remove(&my_id); s.notice = Some(format!("Стрим не запустился: {e:#}")); }),
                 }
             },
 
@@ -484,7 +523,7 @@ async fn session(
                     if let Some(err) = p.error() {
                         publisher = None;
                         let _ = ctl_tx.send(ClientMsg::StopStream);
-                        set(shared, repaint, |s| { s.publishing = None; s.notice = Some(format!("Стрим остановлен: {err}")); });
+                        set(shared, repaint, |s| { s.publishing = None; s.frames.remove(&my_id); s.notice = Some(format!("Стрим остановлен: {err}")); });
                     } else {
                         let (fps, kbps, drops, frames, ap) = (p.fps_now, p.kbps_now, p.drops(), p.frames(), p.audio_packets());
                         let target = p.kbps.load(Ordering::Relaxed);

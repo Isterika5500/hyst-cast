@@ -89,6 +89,16 @@ impl Encoder {
         }
     }
 
+    /// Ветка превью для самого стримера: из кадров перед кодером — маленький RGBA в обычной памяти.
+    pub fn preview_desc(&self, w: u32, h: u32) -> String {
+        let dims = format!("width={w},height={h},pixel-aspect-ratio=1/1");
+        match self.path {
+            MemPath::Va => format!("{} ! video/x-raw,format=RGBA,{dims}", va_postproc_for(&self.factory)),
+            MemPath::D3d11 => format!("d3d11convert ! video/x-raw(memory:D3D11Memory),format=RGBA,{dims} ! d3d11download ! video/x-raw,format=RGBA,{dims}"),
+            MemPath::System => format!("videoconvert ! videoscale ! video/x-raw,format=RGBA,{dims}"),
+        }
+    }
+
     /// Настройки под низкую задержку: без B-кадров, CBR, ключевой кадр каждые 2 с.
     pub fn configure(&self, enc: &gst::Element, kbps: u32, fps: u32) {
         let gop = (fps * 2).to_string();
@@ -164,7 +174,7 @@ pub fn set(el: &gst::Element, name: &str, value: &str) {
 }
 
 /// `varenderD129h264lpenc` → `varenderD129postproc`, `vah264enc` → `vapostproc`.
-fn va_postproc_for(enc: &str) -> String {
+pub fn va_postproc_for(enc: &str) -> String {
     let base = enc.strip_suffix("h264lpenc").or_else(|| enc.strip_suffix("h264enc")).unwrap_or("va");
     format!("{base}postproc")
 }
@@ -290,6 +300,11 @@ fn run_probe(desc: &str, setup: impl FnOnce(&gst::Pipeline)) -> bool {
 }
 
 static WORKING: Mutex<Option<Vec<Encoder>>> = Mutex::new(None);
+
+/// Уже проверенные кодеры, если проверка закончилась (без ожидания — для окна настроек).
+pub fn cached_encoders() -> Option<Vec<Encoder>> {
+    WORKING.try_lock().ok().and_then(|g| g.clone())
+}
 
 /// Рабочие кодеры по убыванию качества (результат кешируется на время работы программы).
 pub fn working_encoders(force: &str) -> Vec<Encoder> {
