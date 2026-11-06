@@ -53,6 +53,11 @@ pub struct WatchStats {
     pub kbps: f64,
     pub margin_ms: i64,
     pub resyncs: u64,
+    pub late_drops: u64,
+    /// Задержка «захват → показ», мс (только в самопроверке, когда стример в том же процессе).
+    pub latency_ms: i64,
+    /// Перцентили опоздания звуковых пакетов относительно самого быстрого.
+    pub jitter: String,
     pub decoder: String,
 }
 
@@ -93,6 +98,8 @@ pub enum Cmd {
     Watch(u32),
     Unwatch(u32),
     Volume(u32, f64),
+    /// Только для самопроверки: оборвать соединение, как при сбое сети.
+    DebugDrop,
 }
 
 pub type SharedRef = Arc<Mutex<Shared>>;
@@ -100,8 +107,19 @@ pub type Repaint = Arc<dyn Fn() + Send + Sync>;
 
 pub fn spawn(rt: &tokio::runtime::Handle, shared: SharedRef, repaint: Repaint, mode: SinkMode) -> mpsc::UnboundedSender<Cmd> {
     let (tx, rx) = mpsc::unbounded_channel();
-    rt.spawn(controller(rx, shared, repaint, mode));
+    // Слабая ссылка на свой же канал: контроллер сам себе шлёт команды (восстановление после обрыва),
+    // но не мешает каналу закрыться, когда окно закрыли.
+    rt.spawn(controller(rx, tx.downgrade(), shared, repaint, mode));
     tx
+}
+
+/// Что было запущено — чтобы после обрыва связи всё вернулось само.
+#[derive(Default)]
+struct Resume {
+    /// Параметры стрима, если стримили.
+    publish: Option<(Source, Preset, bool, String, Option<String>)>,
+    /// Кого смотрели (по имени: после переподключения id другие).
+    watch: std::collections::HashSet<String>,
 }
 
 enum Exit {
@@ -119,8 +137,9 @@ impl std::fmt::Display for Fatal {
 }
 impl std::error::Error for Fatal {}
 
-async fn controller(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: SharedRef, repaint: Repaint, mode: SinkMode) {
+async fn controller(mut rx: mpsc::UnboundedReceiver<Cmd>, me: mpsc::WeakUnboundedSender<Cmd>, shared: SharedRef, repaint: Repaint, mode: SinkMode) {
     loop {
+        let mut resume = Resume::default();
         let cfg = loop {
             match rx.recv().await {
                 Some(Cmd::Connect(c)) => break c,
@@ -130,7 +149,7 @@ async fn controller(mut rx: mpsc::UnboundedReceiver<Cmd>, shared: SharedRef, rep
         };
         loop {
             set(&shared, &repaint, |s| s.status = Status::Connecting);
-            let r = session(&cfg, &mut rx, &shared, &repaint, mode).await;
+            let r = session(&cfg, &mut rx, &me, &mut resume, &shared, &repaint, mode).await;
             reset(&shared);
             match r {
                 Ok(Exit::User) => {
@@ -190,7 +209,22 @@ fn now_ms() -> u64 {
 
 type Viewers = Arc<Mutex<HashMap<u32, Arc<Viewer>>>>;
 
-async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &SharedRef, repaint: &Repaint, mode: SinkMode) -> Result<Exit> {
+#[allow(clippy::too_many_arguments)]
+async fn session(
+    cfg: &Config,
+    rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    me: &mpsc::WeakUnboundedSender<Cmd>,
+    resume: &mut Resume,
+    shared: &SharedRef,
+    repaint: &Repaint,
+    mode: SinkMode,
+) -> Result<Exit> {
+    let me = me.clone();
+    let self_send = move |c: Cmd| {
+        if let Some(tx) = me.upgrade() {
+            let _ = tx.send(c);
+        }
+    };
     anyhow::ensure!(!cfg.server.is_empty(), Fatal("Не указан адрес сервера".into()));
     let addr = tokio::net::lookup_host(&cfg.server)
         .await
@@ -202,7 +236,7 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
     endpoint.set_default_client_config(tls::client_config(&cfg.fingerprint).map_err(|e| Fatal(format!("{e:#}")))?);
     let conn = tokio::time::timeout(Duration::from_secs(8), endpoint.connect(addr, "hyst-cast")?)
         .await
-        .map_err(|_| anyhow!("сервер не отвечает (UDP {addr} закрыт?)"))?
+        .map_err(|_| anyhow!("сервер не отвечает — проверь интернет; если Windows спросил про брандмауэр, нажми «Разрешить» (повторяю через 3 с)"))?
         .map_err(|e| {
             if e.to_string().contains("сертификат") || e.to_string().contains("certificate") {
                 anyhow::Error::new(Fatal(format!("Сервер не тот: {e}")))
@@ -228,6 +262,21 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
         other => return Err(anyhow!("неожиданный ответ сервера: {other:?}")),
     };
     repaint();
+
+    // После обрыва связи — вернуть всё как было
+    if let Some((source, preset, audio, encoder, portal_token)) = resume.publish.clone() {
+        info!("восстанавливаю стрим после переподключения");
+        self_send(Cmd::Start { source, preset, audio, encoder, portal_token });
+    }
+    let rewatch: Vec<u32> = {
+        let s = shared.lock().unwrap();
+        s.peers.iter().filter(|(_, p)| p.stream.is_some() && resume.watch.contains(&p.name)).map(|(id, _)| *id).collect()
+    };
+    for id in rewatch {
+        info!("восстанавливаю просмотр {id}");
+        self_send(Cmd::Watch(id));
+    }
+    let mut last_log = Instant::now();
 
     // Отправка управляющих сообщений
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ClientMsg>();
@@ -292,6 +341,7 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
                 Some(Cmd::Connect(_)) => {}
                 Some(Cmd::Start { source, preset, audio, encoder, portal_token }) => {
                     if publisher.is_some() || shared.lock().unwrap().starting { continue }
+                    resume.publish = Some((source.clone(), preset, audio, encoder.clone(), portal_token.clone()));
                     set(shared, repaint, |s| { s.starting = true; s.notice = None; });
                     let (ptx, prx) = mpsc::channel::<publish::Out>(publish::SEND_QUEUE);
                     let st = start_tx.clone();
@@ -307,6 +357,7 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
                     });
                 }
                 Some(Cmd::Stop) => {
+                    resume.publish = None;
                     if publisher.take().is_some() {
                         let _ = ctl_tx.send(ClientMsg::StopStream);
                     }
@@ -317,6 +368,8 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
                     let info = shared.lock().unwrap().peers.get(&id).and_then(|p| p.stream.clone().map(|s| (p.name.clone(), s)));
                     let Some((name, info)) = info else { continue };
                     if viewers.lock().unwrap().contains_key(&id) { continue }
+                    resume.watch.insert(name.clone());
+                    prev.remove(&id);
                     set(shared, repaint, |s| if let Some(p) = s.peers.get_mut(&id) { p.watching = true; p.stats = "подключение…".into(); });
                     let latency = cfg.latency_ms;
                     let vt = vw_tx.clone();
@@ -326,10 +379,12 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
                     });
                 }
                 Some(Cmd::Unwatch(id)) => {
+                    if let Some(n) = shared.lock().unwrap().peers.get(&id).map(|p| p.name.clone()) { resume.watch.remove(&n); }
                     viewers.lock().unwrap().remove(&id);
                     let _ = ctl_tx.send(ClientMsg::Unwatch { id });
                     set(shared, repaint, |s| { if let Some(p) = s.peers.get_mut(&id) { p.watching = false; p.stats.clear(); } s.watch.remove(&id); });
                 }
+                Some(Cmd::DebugDrop) => break Err(anyhow!("тест: обрыв связи")),
                 Some(Cmd::Volume(id, v)) => {
                     volumes.insert(id, v);
                     if let Some(vw) = viewers.lock().unwrap().get(&id) { vw.set_volume(v); }
@@ -349,9 +404,14 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
                         if watching {
                             // Стример перезапустил стрим — пересоздаём окно под новые параметры
                             viewers.lock().unwrap().remove(&id);
+                            let _ = ctl_tx.send(ClientMsg::Unwatch { id });
                         }
+                        let name = shared.lock().unwrap().peers.get(&id).map(|p| p.name.clone()).unwrap_or_default();
                         set(shared, repaint, |s| if let Some(p) = s.peers.get_mut(&id) { p.stream = Some(info.clone()); p.watching = false; });
-                        if watching { let _ = ctl_tx.send(ClientMsg::Unwatch { id }); }
+                        // Смотрели этого человека раньше (перезапуск стрима, переподключение) — открываем сами
+                        if watching || resume.watch.contains(&name) {
+                            self_send(Cmd::Watch(id));
+                        }
                     }
                     ServerMsg::StreamStopped { id } => {
                         viewers.lock().unwrap().remove(&id);
@@ -430,6 +490,7 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
                         viewers.lock().unwrap().remove(&id);
                         let _ = ctl_tx.send(ClientMsg::Unwatch { id });
                         let closed_by_user = why.to_lowercase().contains("closed") || why.to_lowercase().contains("закрыт");
+                        if let Some(n) = shared.lock().unwrap().peers.get(&id).map(|p| p.name.clone()) { resume.watch.remove(&n); }
                         set(shared, repaint, |s| {
                             if let Some(p) = s.peers.get_mut(&id) { p.watching = false; p.stats.clear(); }
                             s.watch.remove(&id);
@@ -442,21 +503,44 @@ async fn session(cfg: &Config, rx: &mut mpsc::UnboundedReceiver<Cmd>, shared: &S
                     let e = prev.entry(id).or_insert((Instant::now(), rendered, bytes));
                     let dt = e.0.elapsed().as_secs_f64();
                     if dt < 1.0 { continue }
-                    let fps = (rendered - e.1) as f64 / dt;
-                    let kbps = (bytes - e.2) as f64 * 8.0 / dt / 1000.0;
+                    let fps = rendered.saturating_sub(e.1) as f64 / dt;
+                    let kbps = bytes.saturating_sub(e.2) as f64 * 8.0 / dt / 1000.0;
                     *e = (Instant::now(), rendered, bytes);
                     let margin = st.margin_ms.load(Ordering::Relaxed);
                     let resyncs = st.resyncs.load(Ordering::Relaxed);
                     let audio_rendered = st.audio_rendered.load(Ordering::Relaxed);
+                    let latency_ms = st.latency_ms.load(Ordering::Relaxed);
+                    let jitter = {
+                        let mut j = st.jitter_samples.lock().unwrap().clone();
+                        if j.len() > 50 {
+                            j.sort_unstable();
+                            let min = j[0];
+                            let p = |q: f64| j[((j.len() - 1) as f64 * q) as usize] - min;
+                            format!("50% ≤{} мс, 95% ≤{} мс, 99% ≤{} мс, макс {} мс", p(0.5), p(0.95), p(0.99), p(1.0))
+                        } else {
+                            String::new()
+                        }
+                    };
                     set(shared, repaint, |s| {
                         let dec = s.watch.get(&id).map(|w| w.decoder.clone()).unwrap_or_default();
                         if let Some(p) = s.peers.get_mut(&id) {
                             p.stats = format!("{fps:.0} fps · {:.1} Мбит/с · запас {margin} мс · {dec}", kbps / 1000.0);
                         }
-                        s.watch.insert(id, WatchStats { rendered, received, audio_rendered, fps, kbps, margin_ms: margin, resyncs, decoder: dec });
+                        s.watch.insert(id, WatchStats { rendered, received, audio_rendered, fps, kbps, margin_ms: margin, resyncs, late_drops: st.late_drops.load(Ordering::Relaxed), latency_ms, jitter, decoder: dec });
                     });
                 }
                 let _ = my_id;
+                // Раз в 30 с — статистика в лог (по логу друга будет видно, что происходило)
+                if last_log.elapsed() >= Duration::from_secs(30) {
+                    last_log = Instant::now();
+                    let s = shared.lock().unwrap();
+                    if let Some(p) = &s.publishing { info!("статистика стрима: {} · зрители: {:?}", p.stats, p.viewers); }
+                    for (id, w) in &s.watch {
+                        info!("статистика просмотра {id}: {:.0} fps, {:.1} Мбит/с, запас {} мс, пересинхронизаций {}, задержка {} мс, {}",
+                            w.fps, w.kbps / 1000.0, w.margin_ms, w.resyncs, w.latency_ms, w.decoder);
+                    }
+                    if let Some(r) = s.rtt_ms { info!("пинг до сервера: {r} мс"); }
+                }
             }
         }
     };
@@ -513,6 +597,7 @@ async fn send_media(conn: quinn::Connection, mut rx: mpsc::Receiver<publish::Out
         }
         let _ = s.finish();
         if o.video {
+            link.rtt_us.store(conn.rtt().as_micros() as u64, Ordering::Relaxed);
             let d = o.t.elapsed().as_micros() as u64;
             let old = link.delay_us.load(Ordering::Relaxed);
             link.delay_us.store((old * 7 + d) / 8, Ordering::Relaxed);

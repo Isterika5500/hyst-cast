@@ -208,9 +208,19 @@ async fn handle_conn(state: Arc<State>, conn: quinn::Connection) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(300)).await;
         anyhow::bail!("комната полна");
     }
+    let mut name = name;
     {
         let mut rooms = state.rooms.lock().unwrap();
         let r = rooms.entry(room.clone()).or_default();
+        // Одинаковые имена путают — второму «Вася» достаётся «Вася 2»
+        if r.peers.values().any(|p| p.name == name) {
+            let base = name.clone();
+            let mut n = 2;
+            while r.peers.values().any(|p| p.name == format!("{base} {n}")) {
+                n += 1;
+            }
+            name = format!("{base} {n}");
+        }
         let peers = r
             .peers
             .iter()
@@ -408,6 +418,9 @@ fn spawn_forwarder(
     const AUDIO_MAX_AGE: Duration = Duration::from_millis(500);
     tokio::spawn(async move {
         let mut last_slow = Instant::now() - Duration::from_secs(10);
+        // Минимальный RTT до зрителя: если текущий сильно выше — у зрителя копится очередь в роутере
+        let mut min_rtt = Duration::MAX;
+        let mut min_rtt_at = Instant::now();
         while let Some((t, pkt, video, key)) = rx.recv().await {
             if video {
                 if need_key.load(Ordering::Relaxed) && !key {
@@ -430,6 +443,17 @@ fn spawn_forwarder(
             } else if t.elapsed() > AUDIO_MAX_AGE {
                 dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
+            }
+            if video {
+                let rtt = conn.rtt();
+                if rtt < min_rtt || min_rtt_at.elapsed() > Duration::from_secs(30) {
+                    min_rtt = rtt;
+                    min_rtt_at = Instant::now();
+                }
+            }
+            if video && conn.rtt().saturating_sub(min_rtt) > Duration::from_millis(100) && last_slow.elapsed() > Duration::from_secs(1) {
+                last_slow = Instant::now();
+                let _ = ctl.send(ServerMsg::SlowViewer { name: viewer_name.clone() });
             }
             let Ok(mut s) = conn.open_uni().await else { break };
             let _ = s.set_priority(if video { 0 } else { 10 });

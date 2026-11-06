@@ -22,6 +22,9 @@ pub enum SinkMode {
     Fake,
 }
 
+/// Сколько опозданий за 2 с считать «сеть стала медленнее» и сдвигать синхронизацию.
+const LATE_RESYNC: u32 = 12;
+
 #[derive(Default)]
 pub struct ViewerStats {
     pub rendered: AtomicU64,
@@ -31,6 +34,12 @@ pub struct ViewerStats {
     /// Минимальный запас до показа за последнее окно, мс (отрицательный — кадры опаздывают).
     pub margin_ms: AtomicI64,
     pub resyncs: AtomicU64,
+    /// Звуковых пакетов выброшено из-за опоздания (замаскированы декодером).
+    pub late_drops: AtomicU64,
+    /// Задержка «захват → показ», мс, сглаженная (-1 — неизвестно).
+    pub latency_ms: AtomicI64,
+    /// Задержки прихода звуковых пакетов относительно самого быстрого, мс (для анализа джиттера).
+    pub jitter_samples: Mutex<Vec<i64>>,
 }
 
 struct SyncState {
@@ -50,6 +59,7 @@ pub struct Viewer {
     sync: Mutex<SyncState>,
     latency_ns: i64,
     got_key: AtomicBool,
+    offset_pub: Arc<AtomicI64>,
     pub stats: Arc<ViewerStats>,
     pub closed: Arc<Mutex<Option<String>>>,
     stop_bus: Arc<AtomicBool>,
@@ -103,6 +113,8 @@ impl Viewer {
         let asrc = pipeline.by_name("asrc").map(|e| e.downcast::<gst_app::AppSrc>().unwrap());
         let volume = pipeline.by_name("vol");
         let stats = Arc::new(ViewerStats::default());
+        stats.latency_ms.store(-1, Ordering::Relaxed);
+        let offset_pub = Arc::new(AtomicI64::new(i64::MIN));
 
         if let Some(out) = pipeline.by_name("vout") {
             if out.find_property("fullscreen-toggle-mode").is_some() {
@@ -110,8 +122,24 @@ impl Viewer {
             }
             if let Some(pad) = out.static_pad("sink") {
                 let st = stats.clone();
-                pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                let off = offset_pub.clone();
+                let el = out.clone();
+                pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
                     st.rendered.fetch_add(1, Ordering::Relaxed);
+                    // Задержка: сейчас − (база стримера + время кадра у стримера). Имеет смысл, только когда
+                    // стример в этом же процессе (самопроверка) и часы одни и те же.
+                    let base = crate::publish::SENDER_BASE_NS.load(Ordering::Relaxed) as i64;
+                    let o = off.load(Ordering::Relaxed);
+                    if let (Some(buf), Some(clock), true) = (info.buffer(), el.clock(), base > 0 && o != i64::MIN) {
+                        if let (Some(pts), now) = (buf.pts(), clock.time()) {
+                            let sender_pts = pts.nseconds() as i64 - o;
+                            let lat = (now.nseconds() as i64 - (base + sender_pts)) / 1_000_000;
+                            if (0..10_000).contains(&lat) {
+                                let old = st.latency_ms.load(Ordering::Relaxed);
+                                st.latency_ms.store(if old < 0 { lat } else { (old * 7 + lat) / 8 }, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     gst::PadProbeReturn::Ok
                 });
             }
@@ -159,6 +187,7 @@ impl Viewer {
             sync: Mutex::new(SyncState { offset: None, win_min: i64::MAX, win_start: Instant::now(), late_video: 0, late_start: Instant::now() }),
             latency_ns: latency_ms as i64 * 1_000_000,
             got_key: AtomicBool::new(false),
+            offset_pub,
             stats,
             closed,
             stop_bus,
@@ -186,37 +215,44 @@ impl Viewer {
             self.stats.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
         }
         let pts = pts_us as i64 * 1000;
+        if kind == MediaKind::Audio {
+            let mut j = self.stats.jitter_samples.lock().unwrap();
+            if j.len() < 20_000 {
+                j.push((now - pts) / 1_000_000);
+            }
+        }
         let out = {
             let mut st = self.sync.lock().unwrap();
             let off = *st.offset.get_or_insert(now + self.latency_ns - pts);
             let mut out = pts + off;
             let margin = out - now;
-            // Звук важнее: опоздал звук — пересинхронизируемся сразу. Опоздавший кадр видео просто
-            // покажется чуть позже; сдвигаемся, только если видео опаздывает систематически.
-            let video_late_persist = if kind == MediaKind::Video && margin < 5_000_000 {
-                if st.late_start.elapsed() > Duration::from_secs(3) {
+            // Одиночный опоздавший пакет (выброс в сети) не сдвигает синхронизацию: звук выкидываем —
+            // декодер Opus замаскирует 20 мс, кадр видео отдаём как есть (он нужен декодеру как опора).
+            // Сдвигаемся, только если опаздывает много пакетов подряд — значит, сеть стала медленнее.
+            let mut drop_packet = false;
+            if margin < 5_000_000 {
+                if st.late_start.elapsed() > Duration::from_secs(2) {
                     st.late_video = 0;
                     st.late_start = Instant::now();
                 }
                 st.late_video += 1;
-                st.late_video >= 20
+                if st.late_video >= LATE_RESYNC {
+                    st.late_video = 0;
+                    let new_off = now + self.latency_ns - pts;
+                    st.offset = Some(new_off);
+                    out = pts + new_off;
+                    self.stats.resyncs.fetch_add(1, Ordering::Relaxed);
+                    st.win_min = i64::MAX;
+                    st.win_start = Instant::now();
+                } else if kind == MediaKind::Audio {
+                    drop_packet = true;
+                    self.stats.late_drops.fetch_add(1, Ordering::Relaxed);
+                }
             } else {
-                false
-            };
-            if (kind == MediaKind::Audio && margin < 5_000_000) || video_late_persist {
-                st.late_video = 0;
-                // Пакет опоздал (сеть подвисла или часы стримера отстают) — сдвигаемся, чтобы снова был запас
-                let new_off = now + self.latency_ns - pts;
-                st.offset = Some(new_off);
-                out = pts + new_off;
-                self.stats.resyncs.fetch_add(1, Ordering::Relaxed);
-                st.win_min = i64::MAX;
-                st.win_start = Instant::now();
-            } else if margin >= 5_000_000 {
                 st.win_min = st.win_min.min(margin);
                 if st.win_start.elapsed() > Duration::from_secs(5) {
-                    // Запас стабильно больше нужного (часы стримера спешат) — догоняем
-                    if st.win_min > self.latency_ns + 150_000_000 {
+                    // Запас стабильно больше нужного (сеть ускорилась / часы стримера спешат) — догоняем
+                    if st.win_min > self.latency_ns + 100_000_000 {
                         let back = st.win_min - self.latency_ns;
                         st.offset = Some(off - back);
                         self.stats.resyncs.fetch_add(1, Ordering::Relaxed);
@@ -228,6 +264,10 @@ impl Viewer {
                     self.stats.margin_ms.store(margin / 1_000_000, Ordering::Relaxed);
                 }
             }
+            if drop_packet {
+                return;
+            }
+            self.offset_pub.store(st.offset.unwrap_or(i64::MIN), Ordering::Relaxed);
             out
         };
         if out < 0 {

@@ -170,7 +170,7 @@ fn selftest(args: &[String]) -> Result<()> {
         token: token.clone(),
         name: name.into(),
         room: room.clone(),
-        latency_ms: 200,
+        latency_ms: arg(args, "--latency").and_then(|s| s.parse().ok()).unwrap_or(200),
         ..Default::default()
     };
     let nop: net::Repaint = Arc::new(|| {});
@@ -239,21 +239,29 @@ fn selftest(args: &[String]) -> Result<()> {
 
     println!("[5/5] итог");
     println!("      стример: кодер {enc}, {:.0} fps, {:.1} Мбит/с, выкинуто {} кадров, звук {} пакетов", p.fps, p.kbps / 1000.0, p.drops, p.audio_packets);
-    println!("      зритель: декодер {}, показано {:.1} fps, звук {:.0} буф/с, запас {} мс, пересинхронизаций {}", w1.decoder, fps, audio_rate, w1.margin_ms, w1.resyncs);
+    println!("      зритель: декодер {}, показано {:.1} fps, звук {:.0} буф/с, запас {} мс, пересинхронизаций {}, выкинуто опоздавших звуков {}, задержка захват→показ {} мс", w1.decoder, fps, audio_rate, w1.margin_ms, w1.resyncs, w1.late_drops, w1.latency_ms);
     let report = format!(
-        "{{\"encoder\":{:?},\"decoder\":{:?},\"fps\":{fps:.1},\"target_fps\":{},\"audio_buffers_per_s\":{audio_rate:.1},\"kbps\":{:.0},\"drops\":{},\"margin_ms\":{},\"resyncs\":{}}}",
-        enc, w1.decoder, preset.fps, p.kbps, p.drops, w1.margin_ms, w1.resyncs
+        "{{\"encoder\":{:?},\"decoder\":{:?},\"fps\":{fps:.1},\"target_fps\":{},\"audio_buffers_per_s\":{audio_rate:.1},\"kbps\":{:.0},\"drops\":{},\"margin_ms\":{},\"resyncs\":{},\"latency_ms\":{}}}",
+        enc, w1.decoder, preset.fps, p.kbps, p.drops, w1.margin_ms, w1.resyncs, w1.latency_ms
     );
     println!("{report}");
+    if !w1.jitter.is_empty() {
+        println!("      джиттер звука (насколько позже самого быстрого пакета): {}", w1.jitter);
+    }
     if let Some(path) = arg(args, "--report") {
         let _ = std::fs::write(path, &report);
+    }
+
+    let mut problems = Vec::new();
+    if args.iter().any(|a| a == "--extended") {
+        let ctx = Ext { rt: rt.handle().clone(), sa: sa.clone(), sb: sb.clone(), ta: ta.clone(), tb: tb.clone(), mk: &mk, server: server.clone(), preset };
+        problems.extend(extended(&ctx));
     }
 
     ta.send(net::Cmd::Disconnect).ok();
     tb.send(net::Cmd::Disconnect).ok();
     std::thread::sleep(Duration::from_millis(500));
 
-    let mut problems = Vec::new();
     if fps < preset.fps as f64 * 0.6 {
         problems.push(format!("мало кадров у зрителя: {fps:.1} из {}", preset.fps));
     }
@@ -266,4 +274,122 @@ fn selftest(args: &[String]) -> Result<()> {
     } else {
         bail!("САМОПРОВЕРКА НЕ ПРОЙДЕНА: {}", problems.join("; "))
     }
+}
+
+// ---------------------------------------------------------------- расширенная самопроверка
+
+struct Ext<'a> {
+    rt: tokio::runtime::Handle,
+    sa: net::SharedRef,
+    sb: net::SharedRef,
+    ta: tokio::sync::mpsc::UnboundedSender<net::Cmd>,
+    tb: tokio::sync::mpsc::UnboundedSender<net::Cmd>,
+    mk: &'a dyn Fn(&str, &str) -> config::Config,
+    server: String,
+    preset: config::Preset,
+}
+
+fn id_by_name(s: &net::SharedRef, name: &str) -> Option<u32> {
+    s.lock().unwrap().peers.iter().find(|(_, p)| p.name == name).map(|(id, _)| *id)
+}
+
+/// Ждём, пока у зрителя пойдут кадры от стримера с этим именем.
+fn frames_from(s: &net::SharedRef, name: &str, secs: u64) -> bool {
+    wait_until("кадры", Duration::from_secs(secs), || {
+        let st = s.lock().unwrap();
+        let id = st.peers.iter().find(|(_, p)| p.name == name).map(|(id, _)| *id)?;
+        st.watch.get(&id).filter(|w| w.rendered > 10).map(|_| Ok(()))
+    })
+    .is_ok()
+}
+
+fn status_is(s: &net::SharedRef, f: impl Fn(&net::Status) -> bool, secs: u64) -> bool {
+    wait_until("статус", Duration::from_secs(secs), || f(&s.lock().unwrap().status).then_some(Ok(()))).is_ok()
+}
+
+fn extended(c: &Ext) -> Vec<String> {
+    let mut bad = Vec::new();
+    let mut check = |name: &str, ok: bool| {
+        println!("      {} {name}", if ok { "✔" } else { "✘" });
+        if !ok {
+            bad.push(name.to_string());
+        }
+    };
+    let new_client = |name: &str, token: Option<&str>| {
+        let s: net::SharedRef = Arc::new(Mutex::new(net::Shared::default()));
+        let t = net::spawn(&c.rt, s.clone(), Arc::new(|| {}), watch::SinkMode::Fake);
+        let mut cfg = (c.mk)(name, &c.server);
+        if let Some(tok) = token {
+            cfg.token = tok.into();
+        }
+        t.send(net::Cmd::Connect(cfg)).ok();
+        (s, t)
+    };
+    println!("[ext] сценарии");
+
+    // 1. Закрыть и снова открыть просмотр
+    let a = id_by_name(&c.sb, "Стример").unwrap_or(0);
+    c.tb.send(net::Cmd::Unwatch(a)).ok();
+    std::thread::sleep(Duration::from_secs(1));
+    let closed = !c.sb.lock().unwrap().watch.contains_key(&a);
+    c.tb.send(net::Cmd::Watch(a)).ok();
+    check("закрыть и снова открыть просмотр", closed && frames_from(&c.sb, "Стример", 20));
+
+    // 2. Стример перезапускает стрим — зритель подхватывает сам
+    c.ta.send(net::Cmd::Stop).ok();
+    let stopped = wait_until("стоп", Duration::from_secs(5), || {
+        c.sb.lock().unwrap().peers.get(&a).filter(|p| p.stream.is_none()).map(|_| Ok(()))
+    })
+    .is_ok();
+    c.ta.send(net::Cmd::Start { source: capture::Source::Test, preset: c.preset, audio: true, encoder: String::new(), portal_token: None }).ok();
+    check("перезапуск стрима: зритель подхватил сам", stopped && frames_from(&c.sb, "Стример", 30));
+
+    // 3. Обрыв связи у зрителя
+    c.tb.send(net::Cmd::DebugDrop).ok();
+    let dropped = status_is(&c.sb, |s| matches!(s, net::Status::Error(_) | net::Status::Connecting), 5);
+    let back = status_is(&c.sb, |s| *s == net::Status::Online, 20);
+    check("обрыв у зрителя: переподключился и смотрит дальше", dropped && back && frames_from(&c.sb, "Стример", 30));
+
+    // 4. Обрыв связи у стримера
+    c.ta.send(net::Cmd::DebugDrop).ok();
+    let dropped = status_is(&c.sa, |s| !matches!(s, net::Status::Online), 5);
+    let back = status_is(&c.sa, |s| *s == net::Status::Online, 20);
+    let streaming = wait_until("стрим снова", Duration::from_secs(40), || c.sa.lock().unwrap().publishing.as_ref().map(|_| Ok(()))).is_ok();
+    check("обрыв у стримера: стрим восстановился сам", dropped && back && streaming);
+    check("обрыв у стримера: зритель снова видит", frames_from(&c.sb, "Стример", 30));
+
+    // 5. Одинаковое имя
+    let (sc, tc) = new_client("Зритель", None);
+    let online = status_is(&sc, |s| *s == net::Status::Online, 15);
+    std::thread::sleep(Duration::from_millis(500));
+    check("одинаковое имя → «Зритель 2»", online && id_by_name(&c.sa, "Зритель 2").is_some());
+    tc.send(net::Cmd::Disconnect).ok();
+
+    // 6. Неверный пароль
+    let (sd, td) = new_client("Чужой", Some("неверный"));
+    let err = wait_until("ошибка пароля", Duration::from_secs(15), || match &sd.lock().unwrap().status {
+        net::Status::Error(e) if e.contains("пароль") => Some(Ok(())),
+        _ => None,
+    })
+    .is_ok();
+    check("неверный пароль → понятная ошибка", err);
+    td.send(net::Cmd::Disconnect).ok();
+
+    // 7. Седьмой в комнату не попадает
+    std::thread::sleep(Duration::from_secs(1));
+    let extra: Vec<_> = (3..=6).map(|i| new_client(&format!("Гость {i}"), None)).collect();
+    let all_in = extra.iter().all(|(s, _)| status_is(s, |st| *st == net::Status::Online, 15));
+    let (s7, t7) = new_client("Седьмой", None);
+    let full = wait_until("полная комната", Duration::from_secs(15), || match &s7.lock().unwrap().status {
+        net::Status::Error(e) if e.contains("заполнена") => Some(Ok(())),
+        _ => None,
+    })
+    .is_ok();
+    check("6 человек входят, седьмой получает «Комната заполнена»", all_in && full);
+    t7.send(net::Cmd::Disconnect).ok();
+    for (_, t) in &extra {
+        t.send(net::Cmd::Disconnect).ok();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    bad
 }

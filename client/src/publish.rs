@@ -17,6 +17,10 @@ use tracing::{info, warn};
 /// Очередь пакетов на отправку (~1 с при 60 fps + звук). Переполнилась — канал не тянет.
 pub const SEND_QUEUE: usize = 120;
 
+/// Базовое время конвейера стримера (нс, системные часы) — для точного замера задержки в самопроверке,
+/// где стример и зритель в одном процессе и часы у них общие.
+pub static SENDER_BASE_NS: AtomicU64 = AtomicU64::new(0);
+
 /// Пакет в очереди на отправку.
 pub struct Out {
     pub pkt: Vec<u8>,
@@ -34,6 +38,8 @@ pub struct Link {
     pub delay_us: AtomicU64,
     /// Выкинуто отправителем как устаревшее.
     pub stale: AtomicU64,
+    /// Текущий сглаженный RTT соединения с сервером, мкс (растёт, когда копится очередь в роутере).
+    pub rtt_us: AtomicU64,
 }
 
 #[derive(Default)]
@@ -62,6 +68,9 @@ pub struct Publisher {
     target_kbps: u32,
     pub kbps: AtomicU32,
     last_drops: u64,
+    /// Минимальный RTT за последнее время — «пустой канал». Медленно забывается.
+    min_rtt_us: u64,
+    min_rtt_at: Instant,
     calm: u32,
     last: (Instant, u64, u64),
     pub fps_now: f64,
@@ -233,6 +242,7 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, t
         }
     }
     info!("стрим идёт: кодер {} за {} мс", encoder.label(), t.elapsed().as_millis());
+    SENDER_BASE_NS.store(pipeline.base_time().map(|b| b.nseconds()).unwrap_or(0), Ordering::Relaxed);
 
     // Дальше ошибки конвейера ловит отдельный поток
     let error = Arc::new(Mutex::new(None));
@@ -266,6 +276,8 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, t
         target_kbps: preset.kbps,
         kbps: AtomicU32::new(preset.kbps),
         last_drops: 0,
+        min_rtt_us: u64::MAX,
+        min_rtt_at: Instant::now(),
         calm: 0,
         last: (Instant::now(), 0, 0),
         fps_now: 0.0,
@@ -390,10 +402,19 @@ impl Publisher {
         let cur = self.kbps.load(Ordering::Relaxed);
         let min = (self.target_kbps / 6).max(500);
         let delay = self.send_delay_ms();
-        if drops > self.last_drops || delay > 150 || slow {
+        // Рост RTT: очередь копится в роутере, хотя наша очередь пуста — канал на пределе
+        let rtt = self.shared.link.rtt_us.load(Ordering::Relaxed);
+        if rtt > 0 && (rtt < self.min_rtt_us || self.min_rtt_at.elapsed() > Duration::from_secs(30)) {
+            self.min_rtt_us = rtt;
+            self.min_rtt_at = Instant::now();
+        }
+        let queued_ms = rtt.saturating_sub(self.min_rtt_us) / 1000;
+        let bloat = rtt > 0 && queued_ms > 80;
+        if drops > self.last_drops || delay > 150 || slow || bloat {
             let new = ((cur as f64 * 0.7) as u32).max(min);
             if new != cur {
-                let who = if slow { format!(", зрителю {} не хватает канала", self.slow_name) } else { String::new() };
+                let who = if bloat { format!(", пинг вырос на {queued_ms} мс") } else { String::new() }
+                    + &if slow { format!(", зрителю {} не хватает канала", self.slow_name) } else { String::new() };
                 info!("канал не тянет (задержка {delay} мс{who}): битрейт {cur} → {new} кбит/с");
                 self.encoder.set_bitrate(&self.enc, new);
                 self.kbps.store(new, Ordering::Relaxed);
@@ -401,7 +422,7 @@ impl Publisher {
             self.calm = 0;
         } else {
             self.calm += 1;
-            if self.calm >= 6 && cur < self.target_kbps && delay < 60 {
+            if self.calm >= 6 && cur < self.target_kbps && delay < 60 && queued_ms < 30 {
                 let new = ((cur as f64 * 1.15) as u32).min(self.target_kbps);
                 self.encoder.set_bitrate(&self.enc, new);
                 self.kbps.store(new, Ordering::Relaxed);

@@ -57,7 +57,7 @@ impl Default for Config {
             room: String::new(),
             preset: "1080p30".into(),
             audio: true,
-            latency_ms: 200,
+            latency_ms: 150,
             encoder: String::new(),
             portal_token: None,
         }
