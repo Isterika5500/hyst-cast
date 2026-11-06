@@ -119,7 +119,7 @@ fn probe() -> Result<()> {
     for e in codecs::encoder_candidates() {
         let t = Instant::now();
         let ok = codecs::probe_encoder(&e);
-        println!("  {:<28} {:<7} {:?}  {} ({} мс)", e.factory, if e.family.hardware() { "GPU" } else { "CPU" }, e.path, if ok { "OK" } else { "не работает" }, t.elapsed().as_millis());
+        println!("  {:<28} {:<7} {:?}  {} ({} мс)", e.factory, if e.hw { "GPU" } else { "CPU" }, e.path, if ok { "OK" } else { "не работает" }, t.elapsed().as_millis());
     }
     println!("\nДекодеры H.264:");
     for d in codecs::decoder_candidates() {
@@ -195,7 +195,14 @@ fn selftest(args: &[String]) -> Result<()> {
     let a_id = sa.lock().unwrap().my_id;
 
     println!("[2/5] запуск стрима {} (тест-картинка + тон 440 Гц)", preset.label);
-    ta.send(net::Cmd::Start { source: capture::Source::Test, preset, audio: true, encoder, portal_token: None }).ok();
+    // --source screen — настоящий захват экрана (первый монитор / портал), иначе тест-картинка
+    let source = if arg(args, "--source").as_deref() == Some("screen") {
+        capture::list_sources().into_iter().next().map(|s| s.0).unwrap_or(capture::Source::Test)
+    } else {
+        capture::Source::Test
+    };
+    println!("      источник: {source:?}");
+    ta.send(net::Cmd::Start { source, preset, audio: true, encoder, portal_token: None }).ok();
     wait_until("стрим запустился", Duration::from_secs(90), || {
         let s = sa.lock().unwrap();
         if s.publishing.is_some() {

@@ -162,7 +162,7 @@ fn probe_audio(desc: &str) -> bool {
 fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, test: bool, tx: mpsc::Sender<Out>, link: Arc<Link>) -> Result<Publisher> {
     let mut desc = format!(
         "{video_desc} ! queue max-size-buffers=3 max-size-time=0 max-size-bytes=0 leaky=downstream ! {} ! {} name=enc ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=vsink sync=false max-buffers=8",
-        encoder.convert_desc(preset.width, preset.height),
+        encoder.convert_desc(preset.width, preset.height, video_desc.contains("D3D11Memory")),
         encoder.factory
     );
     if audio {

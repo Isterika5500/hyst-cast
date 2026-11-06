@@ -232,7 +232,7 @@ impl eframe::App for App {
                 ui.label(egui::RichText::new("hyst-cast").strong());
                 match &status {
                     Status::Online => {
-                        ui.colored_label(GREEN, "🟢 в сети");
+                        ui.colored_label(GREEN, "в сети");
                         if let Some(r) = rtt {
                             ui.label(egui::RichText::new(format!("{r} мс")).color(DIM));
                         }

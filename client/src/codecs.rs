@@ -54,15 +54,18 @@ pub struct Encoder {
     pub factory: String,
     pub family: Family,
     pub path: MemPath,
+    /// Аппаратный ли на самом деле (Media Foundation бывает и программным — смотрим описание элемента).
+    pub hw: bool,
 }
 
 impl Encoder {
     pub fn label(&self) -> String {
-        format!("{} ({})", self.factory, if self.family.hardware() { "GPU" } else { "CPU" })
+        format!("{} ({})", self.factory, if self.hw { "GPU" } else { "CPU" })
     }
 
     /// Цепочка «конвертер ! caps» перед кодером, с масштабированием в width×height (поля — чёрные полосы).
-    pub fn convert_desc(&self, width: u32, height: u32) -> String {
+    /// `src_d3d11` — источник отдаёт кадры в видеопамяти D3D11 (захват экрана Windows).
+    pub fn convert_desc(&self, width: u32, height: u32, src_d3d11: bool) -> String {
         let dims = format!("width={width},height={height},pixel-aspect-ratio=1/1");
         match self.path {
             MemPath::Va => {
@@ -74,7 +77,14 @@ impl Encoder {
             }
             MemPath::System => {
                 let fmt = if self.family == Family::OpenH264 || self.family == Family::X264 { "I420" } else { "NV12" };
-                format!("videoconvert ! videoscale add-borders=true ! video/x-raw,format={fmt},{dims}")
+                if src_d3d11 {
+                    // Масштабируем и меняем формат на видеокарте, в обычную память — уже готовый кадр
+                    format!(
+                        "d3d11convert add-borders=true ! video/x-raw(memory:D3D11Memory),format={fmt},{dims} ! d3d11download ! video/x-raw,format={fmt},{dims}"
+                    )
+                } else {
+                    format!("videoconvert ! videoscale add-borders=true ! video/x-raw,format={fmt},{dims}")
+                }
             }
         }
     }
@@ -201,7 +211,8 @@ pub fn encoder_candidates() -> Vec<Encoder> {
             _ => vec![MemPath::System],
         };
         for path in paths {
-            list.push((Encoder { factory: name.clone(), family, path }, lp, 0));
+            let hw = family.hardware() && (family != Family::Mf || f.klass().contains("Hardware"));
+            list.push((Encoder { factory: name.clone(), family, path, hw }, lp, 0));
         }
     }
     // GPU-путь раньше системного для одного и того же кодера
@@ -212,7 +223,13 @@ pub fn encoder_candidates() -> Vec<Encoder> {
         let ok = *cbr_cache.entry(e.factory.clone()).or_insert_with(|| controls_bitrate(&e.factory, e.family));
         *rc = if ok { 0 } else { 1 };
     }
-    list.sort_by_key(|(e, lp, rc)| (!e.family.hardware(), *rc, e.family.order(), !*lp, e.factory.clone(), e.path == MemPath::System));
+    // Программные: x264 (лучшее качество) → openh264 → программный Media Foundation
+    let soft = |f: Family| match f {
+        Family::X264 => 0,
+        Family::OpenH264 => 1,
+        _ => 2,
+    };
+    list.sort_by_key(|(e, lp, rc)| (!e.hw, *rc, if e.hw { e.family.order() } else { soft(e.family) }, !*lp, e.factory.clone(), e.path == MemPath::System));
     list.into_iter().map(|(e, _, _)| e).collect()
 }
 
@@ -234,7 +251,7 @@ fn controls_bitrate(factory: &str, family: Family) -> bool {
 pub fn probe_encoder(e: &Encoder) -> bool {
     let desc = format!(
         "videotestsrc num-buffers=10 ! video/x-raw,width=640,height=360,framerate=30/1 ! {} ! {} name=enc ! h264parse ! fakesink",
-        e.convert_desc(1280, 720),
+        e.convert_desc(1280, 720, false),
         e.factory
     );
     run_probe(&desc, |p| {
