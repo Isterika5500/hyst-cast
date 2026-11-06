@@ -119,7 +119,9 @@ impl Encoder {
                 set(enc, "bitrate", &br);
                 set(enc, "gop-size", &gop);
                 set(enc, "bframes", "0");
+                set(enc, "b-frames", "0"); // новые nvcuda/nvd3d11/nvautogpu-элементы
                 set(enc, "zerolatency", "true");
+                set(enc, "zero-reorder-delay", "true");
                 set(enc, "preset", "p4");
                 set(enc, "tune", "low-latency");
             }

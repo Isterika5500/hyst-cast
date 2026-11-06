@@ -71,6 +71,9 @@ pub struct Publisher {
     /// Минимальный RTT за последнее время — «пустой канал». Медленно забывается.
     min_rtt_us: u64,
     min_rtt_at: Instant,
+    /// Битрейт, выше которого канал уже не справлялся (медленно отпускается).
+    ceiling_kbps: u32,
+    ceiling_at: Instant,
     calm: u32,
     last: (Instant, u64, u64),
     pub fps_now: f64,
@@ -278,6 +281,8 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, t
         last_drops: 0,
         min_rtt_us: u64::MAX,
         min_rtt_at: Instant::now(),
+        ceiling_kbps: preset.kbps,
+        ceiling_at: Instant::now(),
         calm: 0,
         last: (Instant::now(), 0, 0),
         fps_now: 0.0,
@@ -411,6 +416,10 @@ impl Publisher {
         let queued_ms = rtt.saturating_sub(self.min_rtt_us) / 1000;
         let bloat = rtt > 0 && queued_ms > 80;
         if drops > self.last_drops || delay > 150 || slow || bloat {
+            // Запоминаем потолок: битрейт, на котором канал не справился (чуть ниже). Выше него
+            // быстро не лезем — иначе «пила»: разогнались → упёрлись → провал картинки.
+            self.ceiling_kbps = ((cur as f64 * 0.9) as u32).max(min);
+            self.ceiling_at = Instant::now();
             let new = ((cur as f64 * 0.7) as u32).max(min);
             if new != cur {
                 let who = if bloat { format!(", пинг вырос на {queued_ms} мс") } else { String::new() }
@@ -422,11 +431,17 @@ impl Publisher {
             self.calm = 0;
         } else {
             self.calm += 1;
-            if self.calm >= 6 && cur < self.target_kbps && delay < 60 && queued_ms < 30 {
-                let new = ((cur as f64 * 1.15) as u32).min(self.target_kbps);
+            // Потолок медленно отпускаем: раз в 30 с спокойной работы +10%
+            if self.ceiling_kbps < self.target_kbps && self.ceiling_at.elapsed() > Duration::from_secs(30) {
+                self.ceiling_kbps = ((self.ceiling_kbps as f64 * 1.1) as u32).min(self.target_kbps);
+                self.ceiling_at = Instant::now();
+            }
+            let cap = self.ceiling_kbps.min(self.target_kbps);
+            if self.calm >= 6 && cur < cap && delay < 60 && queued_ms < 30 {
+                let new = ((cur as f64 * 1.08) as u32).min(cap);
                 self.encoder.set_bitrate(&self.enc, new);
                 self.kbps.store(new, Ordering::Relaxed);
-                self.calm = 3;
+                self.calm = 4;
             }
         }
         self.last_drops = drops;
