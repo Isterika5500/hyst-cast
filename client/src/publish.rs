@@ -79,6 +79,8 @@ pub struct Publisher {
     pub fps_now: f64,
     pub kbps_now: f64,
     pub portal_token: Option<String>,
+    /// Что за звук идёт в стрим («весь звук, кроме Discord», «только звук этого окна»…).
+    pub audio_hint: String,
     slow_viewers: u32,
     pub slow_name: String,
     _capture: Option<Capture>,
@@ -117,13 +119,19 @@ pub async fn start(
         preset.height = h;
     }
     let video_desc = capture.video_desc.clone();
+    let src2 = source.clone();
     let (encoders, audio_ok) = tokio::task::spawn_blocking(move || {
         let enc = codecs::working_encoders(&force_encoder);
-        let a = audio && probe_audio(&capture::audio_desc(akind));
+        // Первый вариант звука, который реально работает (захват по процессам может не поддерживаться)
+        let a = if audio {
+            capture::audio_candidates(akind, &src2).into_iter().find(|(d, _)| probe_audio(d))
+        } else {
+            None
+        };
         (enc, a)
     })
     .await?;
-    if audio && !audio_ok {
+    if audio && audio_ok.is_none() {
         warn!("звук системы не захватывается — стрим пойдёт без звука");
     }
     if encoders.is_empty() {
@@ -135,10 +143,12 @@ pub async fn start(
         let tx = tx.clone();
         let e2 = enc.clone();
         let link = link.clone();
-        let r = tokio::task::spawn_blocking(move || try_start(&vd, &e2, preset, audio_ok, akind, tx, link)).await?;
+        let ad = audio_ok.as_ref().map(|a| a.0.clone());
+        let r = tokio::task::spawn_blocking(move || try_start(&vd, &e2, preset, ad, tx, link)).await?;
         match r {
             Ok(mut p) => {
                 p.portal_token = capture.portal_token.clone();
+                p.audio_hint = audio_ok.as_ref().map(|a| a.1.clone()).unwrap_or_else(|| "без звука".into());
                 p._capture = Some(capture);
                 return Ok(p);
             }
@@ -151,7 +161,7 @@ pub async fn start(
     Err(last_err.unwrap()).context("Ни один кодер не смог запуститься")
 }
 
-fn probe_audio(desc: &str) -> bool {
+pub fn probe_audio(desc: &str) -> bool {
     let Ok(el) = gst::parse::launch(&format!("{desc} ! fakesink name=s")) else { return false };
     let Ok(p) = el.downcast::<gst::Pipeline>() else { return false };
     let got = Arc::new(AtomicBool::new(false));
@@ -185,7 +195,8 @@ fn probe_audio(desc: &str) -> bool {
     ok
 }
 
-fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, akind: capture::AudioKind, tx: mpsc::Sender<Out>, link: Arc<Link>) -> Result<Publisher> {
+fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio_desc: Option<String>, tx: mpsc::Sender<Out>, link: Arc<Link>) -> Result<Publisher> {
+    let audio = audio_desc.is_some();
     let mut desc = format!(
         "{video_desc} ! queue max-size-buffers=3 max-size-time=0 max-size-bytes=0 leaky=downstream ! {} ! {} name=enc ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=vsink sync=false max-buffers=8",
         encoder.convert_desc(preset.width, preset.height, video_desc.contains("D3D11Memory")),
@@ -194,7 +205,7 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, a
     if audio {
         desc.push_str(&format!(
             " {} ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=128000 frame-size=20 audio-type=generic ! appsink name=asink sync=false max-buffers=50",
-            capture::audio_desc(akind)
+            audio_desc.as_deref().unwrap_or_default()
         ));
     }
     info!("конвейер стрима: {desc}");
@@ -314,6 +325,7 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, a
         fps_now: 0.0,
         kbps_now: 0.0,
         portal_token: None,
+        audio_hint: String::new(),
         slow_viewers: 0,
         slow_name: String::new(),
         _capture: None,

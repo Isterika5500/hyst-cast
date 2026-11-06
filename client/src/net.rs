@@ -489,10 +489,11 @@ async fn session(
                         let (fps, kbps, drops, frames, ap) = (p.fps_now, p.kbps_now, p.drops(), p.frames(), p.audio_packets());
                         let target = p.kbps.load(Ordering::Relaxed);
                         let enc = p.encoder.label();
+                        let hint = p.audio_hint.clone();
                         let limited = if target < p.info_target_kbps() { format!(" · снижено (канал{})", if p.slow_name.is_empty() { String::new() } else { format!(" у {}", p.slow_name) }) } else { String::new() };
                         set(shared, repaint, |s| if let Some(pv) = s.publishing.as_mut() {
                             pv.fps = fps; pv.kbps = kbps; pv.drops = drops; pv.frames = frames; pv.audio_packets = ap;
-                            pv.stats = format!("{fps:.0} fps · {:.1} Мбит/с (цель {:.1}){limited} · {enc}", kbps / 1000.0, target as f64 / 1000.0);
+                            pv.stats = format!("{fps:.0} fps · {:.1} Мбит/с (цель {:.1}){limited} · {enc} · звук: {hint}", kbps / 1000.0, target as f64 / 1000.0);
                         });
                     }
                 }

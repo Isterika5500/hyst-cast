@@ -127,8 +127,15 @@ fn probe() -> Result<()> {
         println!("  {:<28} {:<7} {}", d.factory, if d.hardware { "GPU" } else { "CPU" }, if codecs::probe_decoder(&d) { "OK" } else { "не работает" });
     }
     println!("\nИсточники:");
-    for (_, l) in capture::list_sources() {
+    let sources = capture::list_sources();
+    for (_, l) in &sources {
         println!("  {l}");
+    }
+    println!("\nЗвук для «{}»:", sources.first().map(|s| s.1.as_str()).unwrap_or("—"));
+    if let Some((src, _)) = sources.first() {
+        for (d, hint) in capture::audio_candidates(capture::AudioKind::System, src) {
+            println!("  {:<28} {}  [{d}]", hint, if publish::probe_audio(&d) { "OK" } else { "не работает" });
+        }
     }
     Ok(())
 }
@@ -250,6 +257,7 @@ fn selftest(args: &[String]) -> Result<()> {
     let audio_rate = (w1.audio_rendered - w0.audio_rendered) as f64 / dt;
 
     println!("[5/5] итог");
+    println!("      стример: {}", p.stats);
     println!("      стример: кодер {enc}, {:.0} fps, {:.1} Мбит/с, выкинуто {} кадров, звук {} пакетов", p.fps, p.kbps / 1000.0, p.drops, p.audio_packets);
     println!("      зритель: декодер {}, показано {:.1} fps, звук {:.0} буф/с, запас {} мс, пересинхронизаций {}, выкинуто опоздавших звуков {}, задержка захват→показ {} мс", w1.decoder, fps, audio_rate, w1.margin_ms, w1.resyncs, w1.late_drops, w1.latency_ms);
     let report = format!(

@@ -177,6 +177,40 @@ pub fn audio_desc(kind: AudioKind) -> String {
     return "pulsesrc device=@DEFAULT_MONITOR@ do-timestamp=true".into();
 }
 
+/// Варианты захвата звука по убыванию предпочтения: (описание для конвейера, подпись для человека).
+/// Windows 10 2004+/11 умеет захват по процессам: окно — только звук этого приложения, экран —
+/// всё, кроме Discord (иначе голоса из звонка у друзей звучат дважды). Если не вышло — обычный захват.
+pub fn audio_candidates(kind: AudioKind, source: &Source) -> Vec<(String, String)> {
+    let mut v = Vec::new();
+    #[cfg(windows)]
+    if kind == AudioKind::System && gstreamer::ElementFactory::find("wasapi2src").is_some() {
+        let base = "wasapi2src loopback=true low-latency=true";
+        match source {
+            Source::Window { hwnd } => {
+                if let Some(pid) = win::window_pid(*hwnd) {
+                    v.push((format!("{base} loopback-mode=include-process-tree loopback-target-pid={pid}"), "только звук этого окна".to_string()));
+                }
+            }
+            _ => {
+                if let Some(pid) = win::discord_pid() {
+                    v.push((format!("{base} loopback-mode=exclude-process-tree loopback-target-pid={pid}"), "весь звук, кроме Discord".to_string()));
+                } else {
+                    // Discord не запущен — исключаем себя, чтобы не захватывать чужие стримы, которые смотришь
+                    v.push((format!("{base} loopback-mode=exclude-process-tree loopback-target-pid={}", std::process::id()), "весь звук системы".to_string()));
+                }
+            }
+        }
+    }
+    let _ = source;
+    let hint = match kind {
+        AudioKind::Mic => "микрофон",
+        AudioKind::Test => "тестовый тон",
+        AudioKind::System => "весь звук системы",
+    };
+    v.push((audio_desc(kind), hint.to_string()));
+    v
+}
+
 pub async fn open(source: &Source, fps: u32, max: (u32, u32), portal_token: Option<String>) -> Result<Capture> {
     let _ = &portal_token;
     match source {
@@ -348,6 +382,37 @@ mod win {
             out.push((Source::Window { hwnd: hwnd.0 as u64 }, format!("Окно: {short}")));
         }
         BOOL(1)
+    }
+
+    /// Процесс, которому принадлежит окно.
+    pub fn window_pid(hwnd: u64) -> Option<u32> {
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut pid)) };
+        (pid != 0).then_some(pid)
+    }
+
+    /// Главный процесс Discord (тот, чей родитель — не Discord): его дерево — все процессы Discord.
+    pub fn discord_pid() -> Option<u32> {
+        use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+        let mut procs: Vec<(u32, u32, String)> = Vec::new();
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+            let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+            if Process32FirstW(snap, &mut e).is_ok() {
+                loop {
+                    let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+                    procs.push((e.th32ProcessID, e.th32ParentProcessID, String::from_utf16_lossy(&e.szExeFile[..len]).to_lowercase()));
+                    if Process32NextW(snap, &mut e).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = windows::Win32::Foundation::CloseHandle(snap);
+        }
+        let is_discord = |n: &str| n.starts_with("discord") && n.ends_with(".exe");
+        let ids: std::collections::HashSet<u32> = procs.iter().filter(|p| is_discord(&p.2)).map(|p| p.0).collect();
+        procs.iter().find(|p| is_discord(&p.2) && !ids.contains(&p.1)).map(|p| p.0)
     }
 
     pub fn windows() -> Vec<(Source, String)> {
