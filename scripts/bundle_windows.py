@@ -16,6 +16,7 @@ PLUGINS = [
     "volume", "autodetect", "videotestsrc", "audiotestsrc", "opus", "videoparsersbad",
     "d3d11", "d3d12", "nvcodec", "qsv", "amfcodec", "mediafoundation", "wasapi2", "wasapi",
     "x264", "openh264", "directsound",
+    "playback", "typefindfunctions", "jpeg",  # камера: decodebin + MJPEG
 ]
 # Системные DLL Windows и их «заменители» из MSYS2 (DXVK, Mesa). Их НЕЛЬЗЯ класть рядом с exe:
 # DLL из папки программы перекрывают системные, и всё рисовалось бы через эмуляцию, а не видеокартой.

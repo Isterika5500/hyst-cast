@@ -39,7 +39,7 @@ ROOTS = ["gstreamer", "gst-plugins-base", "gst-plugins-good", "gst-plugins-bad-l
 PLUGINS = ["coreelements", "app", "videoconvertscale", "videorate", "audioconvert", "audioresample",
            "volume", "autodetect", "videotestsrc", "audiotestsrc", "opus", "videoparsersbad",
            "d3d11", "d3d12", "nvcodec", "qsv", "amfcodec", "mediafoundation", "wasapi2", "wasapi",
-           "x264", "openh264", "directsound", "playback", "typefindfunctions", "libav"]
+           "x264", "openh264", "directsound", "playback", "typefindfunctions", "jpeg", "libav"]
 # Тяжёлые/ненужные зависимости, которые точно не нужны выбранным плагинам
 SKIP_PKGS = set()
 

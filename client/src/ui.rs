@@ -737,7 +737,8 @@ impl App {
                         segmented(ui, &mut self.cfg.preset, QUALITY);
                     });
                     ui.allocate_ui_with_layout(Vec2::new(64.0, 52.0), Layout::top_down(Align::Min), |ui| {
-                        caption(ui, "Звук");
+                        let cam = self.sources.get(self.source_idx).is_some_and(|s| s.0.is_camera());
+                        caption(ui, if cam { "Микрофон" } else { "Звук" });
                         toggle(ui, &mut self.cfg.audio);
                     });
                     let rest = ui.available_width();

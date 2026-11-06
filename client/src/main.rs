@@ -197,10 +197,10 @@ fn selftest(args: &[String]) -> Result<()> {
 
     println!("[2/5] запуск стрима {} (тест-картинка + тон 440 Гц)", preset.label);
     // --source screen — настоящий захват экрана (первый монитор / портал), иначе тест-картинка
-    let source = if arg(args, "--source").as_deref() == Some("screen") {
-        capture::list_sources().into_iter().next().map(|s| s.0).unwrap_or(capture::Source::Test)
-    } else {
-        capture::Source::Test
+    let source = match arg(args, "--source").as_deref() {
+        Some("screen") => capture::list_sources().into_iter().next().map(|s| s.0).unwrap_or(capture::Source::Test),
+        Some("camera") => capture::cameras().into_iter().next().map(|s| s.0).context("камер не найдено")?,
+        _ => capture::Source::Test,
     };
     println!("      источник: {source:?}");
     ta.send(net::Cmd::Start { source, preset, audio: true, encoder, portal_token: None }).ok();

@@ -3,9 +3,13 @@
 //! * Linux (Wayland): xdg-desktop-portal ScreenCast → PipeWire → `pipewiresrc`; звук — монитор
 //!   звуковой карты через `pulsesrc` (pipewire-pulse).
 //! * Windows: `d3d11screencapturesrc` (монитор или окно), звук — `wasapi2src loopback=true`.
+//! * Камера (обе ОС): любое устройство из `DeviceMonitor` (PipeWire/V4L2 на Linux, Media Foundation
+//!   на Windows); режим подбирается по возможностям камеры, звук — микрофон.
 //! * Тест: `videotestsrc` + тон 440 Гц — для самопроверки и CI.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use gstreamer as gst;
+use gst::prelude::*;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Source {
@@ -16,6 +20,23 @@ pub enum Source {
     Monitor { index: i32 },
     #[cfg(windows)]
     Window { hwnd: u64 },
+    /// Камера: начало конвейера (элемент-источник) и её возможности (caps) для выбора режима.
+    Camera { src: String, caps: String },
+}
+
+impl Source {
+    pub fn is_camera(&self) -> bool {
+        matches!(self, Source::Camera { .. })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AudioKind {
+    Test,
+    /// Звук системы (то, что слышно в колонках).
+    System,
+    /// Микрофон (для камеры).
+    Mic,
 }
 
 /// Что показать в выпадающем списке «Что стримить».
@@ -28,22 +49,121 @@ pub fn list_sources() -> Vec<(Source, String)> {
         v.extend(win::monitors());
         v.extend(win::windows());
     }
+    v.extend(cameras());
     v.push((Source::Test, "Тестовая картинка".to_string()));
     v
+}
+
+/// Камеры через DeviceMonitor GStreamer: по каждому устройству — строка источника для конвейера.
+pub fn cameras() -> Vec<(Source, String)> {
+    let mon = gst::DeviceMonitor::new();
+    mon.add_filter(Some("Video/Source"), None);
+    let mut v = Vec::new();
+    if mon.start().is_err() {
+        return v;
+    }
+    for d in mon.devices() {
+        let Some(props) = d.properties() else { continue };
+        let factory = d.create_element(None).ok().and_then(|e| e.factory()).map(|f| f.name().to_string()).unwrap_or_default();
+        let prop = |k: &str| -> Option<String> {
+            let val = props.value(k).ok()?;
+            val.get::<String>().ok().or_else(|| val.serialize().ok().map(|s| s.to_string()))
+        };
+        // Linux: если знаем /dev/videoN — берём камеру напрямую через v4l2 и выключаем «динамическую частоту»:
+        // иначе в полумраке камера сама падает до 7–8 fps ради выдержки.
+        let v4l2_path = prop("api.v4l2.path").or_else(|| if factory == "v4l2src" { prop("device.path") } else { None });
+        let src = match factory.as_str() {
+            _ if cfg!(target_os = "linux") && v4l2_path.is_some() => format!(
+                "v4l2src device={} do-timestamp=true extra-controls=\"c,exposure_dynamic_framerate=0\"",
+                v4l2_path.clone().unwrap()
+            ),
+            "pipewiresrc" => match prop("object.serial").or_else(|| prop("node.name")) {
+                Some(id) => format!("pipewiresrc target-object={id} do-timestamp=true"),
+                None => continue,
+            },
+            "v4l2src" => match prop("device.path").or_else(|| prop("api.v4l2.path")) {
+                Some(p) => format!("v4l2src device={p} do-timestamp=true"),
+                None => continue,
+            },
+            "mfvideosrc" => match prop("device.path") {
+                // В синтаксисе конвейера «\\» внутри кавычек — экранирование, а путь вида \\?\usb#… — сплошь из них
+                Some(p) => format!("mfvideosrc device-path=\"{}\"", p.replace('"', "").replace('\\', "\\\\")),
+                None => format!("mfvideosrc device-name=\"{}\"", d.display_name().replace('"', "")),
+            },
+            _ => continue,
+        };
+        let caps = d.caps().map(|c| c.to_string()).unwrap_or_default();
+        let name = d.display_name().replace(" (V4L2)", "");
+        v.push((Source::Camera { src, caps }, format!("Камера: {name}")));
+    }
+    mon.stop();
+    v
+}
+
+/// Лучший режим камеры: наибольшая картинка не больше max_w×max_h при ≥ 24 fps (если такой нет —
+/// просто наибольшая). Возвращает (ширина, высота, кадров/с числитель, знаменатель).
+pub fn best_camera_mode(caps: &str, max_w: u32, max_h: u32, want_fps: u32) -> Option<(u32, u32, i32, i32)> {
+    let caps: gst::Caps = caps.parse().ok()?;
+    let mut modes: Vec<(u32, u32, i32, i32)> = Vec::new();
+    for s in caps.iter() {
+        if s.name() != "video/x-raw" && s.name() != "image/jpeg" {
+            continue;
+        }
+        let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) else { continue };
+        // Частоты: одна, список или диапазон
+        let mut rates: Vec<gst::Fraction> = Vec::new();
+        if let Ok(f) = s.get::<gst::Fraction>("framerate") {
+            rates.push(f);
+        } else if let Ok(list) = s.get::<gst::List>("framerate") {
+            rates.extend(list.iter().filter_map(|v| v.get::<gst::Fraction>().ok()));
+        } else if let Ok(r) = s.get::<gst::FractionRange>("framerate") {
+            let target = gst::Fraction::new(want_fps as i32, 1);
+            rates.push(if target > r.max() { r.max() } else if target < r.min() { r.min() } else { target });
+        }
+        // Самая высокая частота, не выше нужной
+        let best = rates
+            .iter()
+            .filter(|f| f.numer() > 0 && (f.numer() as f64 / f.denom() as f64) <= want_fps as f64 + 0.5)
+            .max_by(|a, b| (a.numer() as f64 / a.denom() as f64).total_cmp(&(b.numer() as f64 / b.denom() as f64)))
+            .or_else(|| rates.iter().min_by(|a, b| (a.numer() as f64 / a.denom() as f64).total_cmp(&(b.numer() as f64 / b.denom() as f64))));
+        if let Some(f) = best {
+            modes.push((w as u32, h as u32, f.numer(), f.denom()));
+        }
+    }
+    let fits = |m: &&(u32, u32, i32, i32)| m.0 <= max_w && m.1 <= max_h;
+    let fps_ok = |m: &&(u32, u32, i32, i32)| m.2 as f64 / m.3 as f64 >= 23.9;
+    let area = |m: &&(u32, u32, i32, i32)| (m.0 * m.1, (m.2 as f64 / m.3 as f64 * 100.0) as u32);
+    modes.iter().filter(fits).filter(fps_ok).max_by_key(area)
+        .or_else(|| modes.iter().filter(fits).max_by_key(area))
+        .or_else(|| modes.iter().min_by_key(|m| m.0 * m.1))
+        .copied()
 }
 
 /// Открытый захват: описание начала конвейера + то, что надо держать живым, пока идёт стрим.
 pub struct Capture {
     pub video_desc: String,
+    /// Свой размер картинки (камера) — тогда кодируем в нём, а не в размере пресета.
+    pub size: Option<(u32, u32)>,
     /// Новый токен портала (Linux), чтобы в следующий раз не спрашивать.
     pub portal_token: Option<String>,
     #[cfg(target_os = "linux")]
     _portal: Option<linux::PortalSession>,
 }
 
-pub fn audio_desc(test: bool) -> String {
-    if test {
+pub fn audio_desc(kind: AudioKind) -> String {
+    if kind == AudioKind::Test {
         return "audiotestsrc is-live=true wave=sine freq=440 volume=0.3".into();
+    }
+    if kind == AudioKind::Mic {
+        #[cfg(windows)]
+        {
+            if gstreamer::ElementFactory::find("wasapi2src").is_some() {
+                return "wasapi2src low-latency=true".into();
+            }
+            return "wasapisrc low-latency=true".into();
+        }
+        #[cfg(not(windows))]
+        return "pulsesrc do-timestamp=true".into();
     }
     #[cfg(windows)]
     {
@@ -57,13 +177,30 @@ pub fn audio_desc(test: bool) -> String {
     return "pulsesrc device=@DEFAULT_MONITOR@ do-timestamp=true".into();
 }
 
-pub async fn open(source: &Source, fps: u32, portal_token: Option<String>) -> Result<Capture> {
+pub async fn open(source: &Source, fps: u32, max: (u32, u32), portal_token: Option<String>) -> Result<Capture> {
     let _ = &portal_token;
     match source {
+        Source::Camera { src, caps } => {
+            let (w, h, fn_, fd) = best_camera_mode(caps, max.0, max.1, fps).context("камера не сообщила ни одного режима")?;
+            // Любой формат (MJPEG или сырой) в выбранном режиме; decodebin сам разберётся, в обычную память
+            let video_desc = format!(
+                "{src} ! capsfilter caps=\"image/jpeg,width={w},height={h},framerate={fn_}/{fd};video/x-raw,width={w},height={h},framerate={fn_}/{fd}\" ! decodebin caps=video/x-raw ! videoconvert ! videorate drop-only=true max-rate={fps}"
+            );
+            tracing::info!("камера: {w}×{h} @ {fn_}/{fd}");
+            // Чётные размеры — кодеры их любят
+            Ok(Capture {
+                video_desc,
+                size: Some((w & !1, h & !1)),
+                portal_token: None,
+                #[cfg(target_os = "linux")]
+                _portal: None,
+            })
+        }
         Source::Test => Ok(Capture {
             video_desc: format!(
                 "videotestsrc is-live=true pattern=ball motion=sweep ! video/x-raw,width=960,height=540,framerate={fps}/1"
             ),
+            size: None,
             portal_token: None,
             #[cfg(target_os = "linux")]
             _portal: None,
@@ -75,13 +212,14 @@ pub async fn open(source: &Source, fps: u32, portal_token: Option<String>) -> Re
             let video_desc = format!(
                 "pipewiresrc fd={fd} path={node} do-timestamp=true keepalive-time=1000 always-copy=false ! videorate drop-only=true max-rate={fps}"
             );
-            Ok(Capture { video_desc, portal_token: token, _portal: Some(session) })
+            Ok(Capture { video_desc, size: None, portal_token: token, _portal: Some(session) })
         }
         #[cfg(windows)]
         Source::Monitor { index } => Ok(Capture {
             video_desc: format!(
                 "d3d11screencapturesrc monitor-index={index} show-cursor=true ! video/x-raw(memory:D3D11Memory),framerate={fps}/1"
             ),
+            size: None,
             portal_token: None,
         }),
         #[cfg(windows)]
@@ -89,6 +227,7 @@ pub async fn open(source: &Source, fps: u32, portal_token: Option<String>) -> Re
             video_desc: format!(
                 "d3d11screencapturesrc window-handle={hwnd} capture-api=wgc show-cursor=true ! video/x-raw(memory:D3D11Memory),framerate={fps}/1"
             ),
+            size: None,
             portal_token: None,
         }),
     }

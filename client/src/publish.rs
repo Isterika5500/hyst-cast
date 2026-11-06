@@ -100,12 +100,26 @@ pub async fn start(
     tx: mpsc::Sender<Out>,
     link: Arc<Link>,
 ) -> Result<Publisher> {
-    let capture = capture::open(&source, preset.fps, portal_token).await?;
-    let test = source == Source::Test;
+    let capture = capture::open(&source, preset.fps, (preset.width, preset.height), portal_token).await?;
+    let akind = if source == Source::Test {
+        capture::AudioKind::Test
+    } else if source.is_camera() {
+        capture::AudioKind::Mic
+    } else {
+        capture::AudioKind::System
+    };
+    // Камера со своим размером: кодируем в нём, битрейт — пропорционально площади кадра
+    let mut preset = preset;
+    if let Some((w, h)) = capture.size {
+        let ratio = (w * h) as f64 / (preset.width * preset.height) as f64;
+        preset.kbps = ((preset.kbps as f64 * ratio.clamp(0.35, 1.0)) as u32).max(800);
+        preset.width = w;
+        preset.height = h;
+    }
     let video_desc = capture.video_desc.clone();
     let (encoders, audio_ok) = tokio::task::spawn_blocking(move || {
         let enc = codecs::working_encoders(&force_encoder);
-        let a = audio && probe_audio(&capture::audio_desc(test));
+        let a = audio && probe_audio(&capture::audio_desc(akind));
         (enc, a)
     })
     .await?;
@@ -121,7 +135,7 @@ pub async fn start(
         let tx = tx.clone();
         let e2 = enc.clone();
         let link = link.clone();
-        let r = tokio::task::spawn_blocking(move || try_start(&vd, &e2, preset, audio_ok, test, tx, link)).await?;
+        let r = tokio::task::spawn_blocking(move || try_start(&vd, &e2, preset, audio_ok, akind, tx, link)).await?;
         match r {
             Ok(mut p) => {
                 p.portal_token = capture.portal_token.clone();
@@ -171,7 +185,7 @@ fn probe_audio(desc: &str) -> bool {
     ok
 }
 
-fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, test: bool, tx: mpsc::Sender<Out>, link: Arc<Link>) -> Result<Publisher> {
+fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, akind: capture::AudioKind, tx: mpsc::Sender<Out>, link: Arc<Link>) -> Result<Publisher> {
     let mut desc = format!(
         "{video_desc} ! queue max-size-buffers=3 max-size-time=0 max-size-bytes=0 leaky=downstream ! {} ! {} name=enc ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=vsink sync=false max-buffers=8",
         encoder.convert_desc(preset.width, preset.height, video_desc.contains("D3D11Memory")),
@@ -180,7 +194,7 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, t
     if audio {
         desc.push_str(&format!(
             " {} ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=128000 frame-size=20 audio-type=generic ! appsink name=asink sync=false max-buffers=50",
-            capture::audio_desc(test)
+            capture::audio_desc(akind)
         ));
     }
     info!("конвейер стрима: {desc}");
@@ -223,7 +237,19 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio: bool, t
         );
     }
 
-    pipeline.set_state(gst::State::Playing).context("конвейер не запустился")?;
+    if let Err(e) = pipeline.set_state(gst::State::Playing) {
+        // Подробная причина лежит в шине (камера занята, нет доступа и т. п.)
+        let detail = pipeline
+            .bus()
+            .and_then(|b| b.timed_pop_filtered(gst::ClockTime::from_mseconds(200), &[gst::MessageType::Error]))
+            .and_then(|m| match m.view() {
+                gst::MessageView::Error(err) => Some(format!("{} ({})", err.error(), err.debug().unwrap_or_default())),
+                _ => None,
+            })
+            .unwrap_or_else(|| e.to_string());
+        let _ = pipeline.set_state(gst::State::Null);
+        bail!("конвейер не запустился: {detail}");
+    }
 
     // Ждём первый закодированный кадр — тогда кодер точно работает
     let bus = pipeline.bus().unwrap();
