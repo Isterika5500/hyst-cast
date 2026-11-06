@@ -72,6 +72,8 @@ pub struct Shared {
     pub notice: Option<String>,
     /// Новый токен портала — интерфейс сохранит его в настройки.
     pub portal_token: Option<String>,
+    /// Кадры стримов для показа в окне (режим Embedded).
+    pub frames: HashMap<u32, Arc<crate::watch::FrameSlot>>,
 }
 
 impl Default for Shared {
@@ -86,6 +88,7 @@ impl Default for Shared {
             rtt_ms: None,
             notice: None,
             portal_token: None,
+            frames: HashMap::new(),
         }
     }
 }
@@ -100,6 +103,8 @@ pub enum Cmd {
     Volume(u32, f64),
     /// Только для самопроверки: оборвать соединение, как при сбое сети.
     DebugDrop,
+    /// Размер видео в окне (в пикселях), чтобы не гонять лишнее.
+    DisplaySize(u32, u32, u32),
 }
 
 pub type SharedRef = Arc<Mutex<Shared>>;
@@ -200,6 +205,7 @@ fn reset(shared: &SharedRef) {
     s.publishing = None;
     s.starting = false;
     s.watch.clear();
+    s.frames.clear();
     s.rtt_ms = None;
 }
 
@@ -373,8 +379,12 @@ async fn session(
                     set(shared, repaint, |s| if let Some(p) = s.peers.get_mut(&id) { p.watching = true; p.stats = "подключение…".into(); });
                     let latency = cfg.latency_ms;
                     let vt = vw_tx.clone();
+                    let slot = (mode == SinkMode::Embedded).then(|| crate::watch::FrameSlot::new(repaint.clone()));
+                    if let Some(sl) = &slot {
+                        shared.lock().unwrap().frames.insert(id, sl.clone());
+                    }
                     tokio::task::spawn_blocking(move || {
-                        let r = Viewer::new(&format!("{name} — hyst-cast"), info.has_audio, latency, mode);
+                        let r = Viewer::new(&format!("{name} — hyst-cast"), info.has_audio, latency, mode, (info.width, info.height), slot);
                         let _ = vt.send((id, r));
                     });
                 }
@@ -382,9 +392,12 @@ async fn session(
                     if let Some(n) = shared.lock().unwrap().peers.get(&id).map(|p| p.name.clone()) { resume.watch.remove(&n); }
                     viewers.lock().unwrap().remove(&id);
                     let _ = ctl_tx.send(ClientMsg::Unwatch { id });
-                    set(shared, repaint, |s| { if let Some(p) = s.peers.get_mut(&id) { p.watching = false; p.stats.clear(); } s.watch.remove(&id); });
+                    set(shared, repaint, |s| { if let Some(p) = s.peers.get_mut(&id) { p.watching = false; p.stats.clear(); } s.watch.remove(&id); s.frames.remove(&id); });
                 }
                 Some(Cmd::DebugDrop) => break Err(anyhow!("тест: обрыв связи")),
+                Some(Cmd::DisplaySize(id, w, h)) => {
+                    if let Some(vw) = viewers.lock().unwrap().get(&id) { vw.set_display_size(w, h); }
+                }
                 Some(Cmd::Volume(id, v)) => {
                     volumes.insert(id, v);
                     if let Some(vw) = viewers.lock().unwrap().get(&id) { vw.set_volume(v); }
@@ -397,7 +410,7 @@ async fn session(
                     ServerMsg::PeerJoined { peer } => set(shared, repaint, |s| { s.peers.insert(peer.id, PeerView { name: peer.name, stream: peer.stream, watching: false, stats: String::new() }); }),
                     ServerMsg::PeerLeft { id } => {
                         viewers.lock().unwrap().remove(&id);
-                        set(shared, repaint, |s| { s.peers.remove(&id); s.watch.remove(&id); });
+                        set(shared, repaint, |s| { s.peers.remove(&id); s.watch.remove(&id); s.frames.remove(&id); });
                     }
                     ServerMsg::StreamStarted { id, info } => {
                         let watching = viewers.lock().unwrap().contains_key(&id);
@@ -415,7 +428,7 @@ async fn session(
                     }
                     ServerMsg::StreamStopped { id } => {
                         viewers.lock().unwrap().remove(&id);
-                        set(shared, repaint, |s| { if let Some(p) = s.peers.get_mut(&id) { p.stream = None; p.watching = false; p.stats.clear(); } s.watch.remove(&id); });
+                        set(shared, repaint, |s| { if let Some(p) = s.peers.get_mut(&id) { p.stream = None; p.watching = false; p.stats.clear(); } s.watch.remove(&id); s.frames.remove(&id); });
                     }
                     ServerMsg::KeyframeRequest => if let Some(p) = &publisher { p.force_keyframe(); },
                     ServerMsg::SlowViewer { name } => if let Some(p) = publisher.as_mut() { p.slow_viewer(&name); },
@@ -493,7 +506,7 @@ async fn session(
                         if let Some(n) = shared.lock().unwrap().peers.get(&id).map(|p| p.name.clone()) { resume.watch.remove(&n); }
                         set(shared, repaint, |s| {
                             if let Some(p) = s.peers.get_mut(&id) { p.watching = false; p.stats.clear(); }
-                            s.watch.remove(&id);
+                            s.watch.remove(&id); s.frames.remove(&id);
                             if !closed_by_user { s.notice = Some(format!("Просмотр прерван: {why}")); }
                         });
                         continue;

@@ -18,8 +18,54 @@ use tracing::{info, warn};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SinkMode {
+    /// Отдельное окно GStreamer (старый вариант, оставлен на всякий случай).
     Window,
     Fake,
+    /// Кадры в RGBA отдаются в окно приложения (как в Discord).
+    Embedded,
+}
+
+/// Готовый кадр для окна приложения.
+pub struct Frame {
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// «Слот» последнего кадра: зритель кладёт, интерфейс забирает при перерисовке.
+pub struct FrameSlot {
+    pub frame: Mutex<Option<Frame>>,
+    pub seq: AtomicU64,
+    pub repaint: crate::net::Repaint,
+}
+
+impl FrameSlot {
+    pub fn new(repaint: crate::net::Repaint) -> Arc<FrameSlot> {
+        Arc::new(FrameSlot { frame: Mutex::new(None), seq: AtomicU64::new(0), repaint })
+    }
+}
+
+/// Размер для показа в окне: не больше 1920×1080 с сохранением пропорций, чётный.
+pub fn display_size(w: u32, h: u32) -> (u32, u32) {
+    let k = (1920.0 / w.max(1) as f64).min(1080.0 / h.max(1) as f64).min(1.0);
+    (((w as f64 * k) as u32) & !1, ((h as f64 * k) as u32) & !1)
+}
+
+/// Цепочка «декодер → RGBA нужного размера в обычной памяти»: масштабирует и переводит цвета видеокарта.
+fn embed_chain(dec: &str, w: u32, h: u32) -> String {
+    let has = |n: &str| gst::ElementFactory::find(n).is_some();
+    let dims = format!("width={w},height={h},pixel-aspect-ratio=1/1");
+    let va_pp = dec.strip_suffix("h264dec").map(|b| format!("{b}postproc")).unwrap_or_default();
+    // Капсфильтры с именами vcaps/vcaps2 — чтобы менять размер на лету под размер видео в окне
+    if dec.starts_with("va") && !dec.starts_with("vaapi") && has(&va_pp) {
+        format!("{va_pp} add-borders=true ! capsfilter name=vcaps caps=\"video/x-raw,format=RGBA,{dims}\"")
+    } else if dec.starts_with("d3d11") && has("d3d11convert") && has("d3d11download") {
+        format!("d3d11convert add-borders=true ! capsfilter name=vcaps caps=\"video/x-raw(memory:D3D11Memory),format=RGBA,{dims}\" ! d3d11download ! capsfilter name=vcaps2 caps=\"video/x-raw,format=RGBA,{dims}\"")
+    } else if dec.starts_with("d3d12") && has("d3d12convert") && has("d3d12download") {
+        format!("d3d12convert add-borders=true ! capsfilter name=vcaps caps=\"video/x-raw(memory:D3D12Memory),format=RGBA,{dims}\" ! d3d12download ! capsfilter name=vcaps2 caps=\"video/x-raw,format=RGBA,{dims}\"")
+    } else {
+        format!("videoconvert ! videoscale add-borders=true ! capsfilter name=vcaps caps=\"video/x-raw,format=RGBA,{dims}\"")
+    }
 }
 
 /// Сколько опозданий за 2 с считать «сеть стала медленнее» и сдвигать синхронизацию.
@@ -76,6 +122,7 @@ impl Drop for Viewer {
 fn video_sink(mode: SinkMode) -> &'static str {
     match mode {
         SinkMode::Fake => "fakesink name=vout sync=true",
+        SinkMode::Embedded => "appsink name=vout sync=true max-buffers=2 drop=true",
         SinkMode::Window => {
             if cfg!(windows) && gst::ElementFactory::find("d3d11videosink").is_some() {
                 "d3d11videosink name=vout sync=true"
@@ -89,13 +136,19 @@ fn video_sink(mode: SinkMode) -> &'static str {
 }
 
 impl Viewer {
-    pub fn new(title: &str, has_audio: bool, latency_ms: u32, mode: SinkMode) -> Result<Viewer> {
+    pub fn new(title: &str, has_audio: bool, latency_ms: u32, mode: SinkMode, size: (u32, u32), slot: Option<Arc<FrameSlot>>) -> Result<Viewer> {
         let decoders = codecs::working_decoders();
         let dec = decoders.first().context("Не найден ни один рабочий декодер H.264")?;
+        let convert = if mode == SinkMode::Embedded {
+            let (w, h) = display_size(size.0, size.1);
+            format!("{} ! ", embed_chain(&dec.factory, w, h))
+        } else {
+            String::new()
+        };
         let mut desc = format!(
             "appsrc name=vsrc is-live=true format=time do-timestamp=false max-bytes=0 max-buffers=0 \
              caps=video/x-h264,stream-format=byte-stream,alignment=au \
-             ! h264parse ! {} ! queue max-size-buffers=3 max-size-time=0 max-size-bytes=0 ! {}",
+             ! h264parse ! {} ! queue max-size-buffers=3 max-size-time=0 max-size-bytes=0 ! {convert}{}",
             dec.factory,
             video_sink(mode)
         );
@@ -116,6 +169,34 @@ impl Viewer {
         stats.latency_ms.store(-1, Ordering::Relaxed);
         let offset_pub = Arc::new(AtomicI64::new(i64::MIN));
 
+        // Кадры в окно приложения: копируем в плотный RGBA (у кадра бывает выравнивание строк) и будим интерфейс
+        if let (Some(slot), Some(out)) = (slot, pipeline.by_name("vout")) {
+            if let Ok(sink) = out.downcast::<gst_app::AppSink>() {
+                sink.set_callbacks(
+                    gst_app::AppSinkCallbacks::builder()
+                        .new_sample(move |s| {
+                            let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                            let (Some(buf), Some(caps)) = (sample.buffer(), sample.caps()) else { return Ok(gst::FlowSuccess::Ok) };
+                            let Ok(info) = gstreamer_video::VideoInfo::from_caps(caps) else { return Ok(gst::FlowSuccess::Ok) };
+                            let Ok(vf) = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buf, &info) else { return Ok(gst::FlowSuccess::Ok) };
+                            let (w, h) = (info.width(), info.height());
+                            use gstreamer_video::prelude::VideoFrameExt;
+                            let stride = vf.plane_stride()[0] as usize;
+                            let Ok(src) = vf.plane_data(0) else { return Ok(gst::FlowSuccess::Ok) };
+                            let row = w as usize * 4;
+                            let mut rgba = Vec::with_capacity(row * h as usize);
+                            for y in 0..h as usize {
+                                rgba.extend_from_slice(&src[y * stride..y * stride + row]);
+                            }
+                            *slot.frame.lock().unwrap() = Some(Frame { w, h, rgba });
+                            slot.seq.fetch_add(1, Ordering::Relaxed);
+                            (slot.repaint)();
+                            Ok(gst::FlowSuccess::Ok)
+                        })
+                        .build(),
+                );
+            }
+        }
         if let Some(out) = pipeline.by_name("vout") {
             if out.find_property("fullscreen-toggle-mode").is_some() {
                 codecs::set(&out, "fullscreen-toggle-mode", "alt-enter");
@@ -193,6 +274,20 @@ impl Viewer {
             stop_bus,
             decoder: format!("{} ({})", dec.factory, if dec.hardware { "GPU" } else { "CPU" }),
         })
+    }
+
+    /// Размер кадра под размер видео в окне (меньше картинка — меньше работы на перерисовку).
+    pub fn set_display_size(&self, w: u32, h: u32) {
+        for name in ["vcaps", "vcaps2"] {
+            let Some(cf) = self.pipeline.by_name(name) else { continue };
+            let Some(old) = cf.property::<Option<gst::Caps>>("caps") else { continue };
+            let mut caps = old.copy();
+            if let Some(s) = caps.make_mut().structure_mut(0) {
+                s.set("width", (w & !1).max(2) as i32);
+                s.set("height", (h & !1).max(2) as i32);
+            }
+            cf.set_property("caps", &caps);
+        }
     }
 
     pub fn set_volume(&self, v: f64) {

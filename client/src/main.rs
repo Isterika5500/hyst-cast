@@ -105,7 +105,7 @@ fn run_gui() -> Result<()> {
             ui::setup(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             let repaint: net::Repaint = Arc::new(move || ctx.request_repaint());
-            let tx = net::spawn(&handle, shared.clone(), repaint, watch::SinkMode::Window);
+            let tx = net::spawn(&handle, shared.clone(), repaint, watch::SinkMode::Embedded);
             Ok(Box::new(ui::App::new(shared, tx)))
         }),
     )
@@ -178,7 +178,18 @@ fn selftest(args: &[String]) -> Result<()> {
     let sa: net::SharedRef = Arc::new(Mutex::new(net::Shared::default()));
     let sb: net::SharedRef = Arc::new(Mutex::new(net::Shared::default()));
     let ta = net::spawn(rt.handle(), sa.clone(), nop.clone(), watch::SinkMode::Fake);
-    let tb = net::spawn(rt.handle(), sb.clone(), nop, if show { watch::SinkMode::Window } else { watch::SinkMode::Fake });
+    let tb = net::spawn(
+        rt.handle(),
+        sb.clone(),
+        nop,
+        if show {
+            watch::SinkMode::Window
+        } else if args.iter().any(|a| a == "--embedded") {
+            watch::SinkMode::Embedded
+        } else {
+            watch::SinkMode::Fake
+        },
+    );
 
     let online = |s: &net::SharedRef| {
         let st = s.lock().unwrap().status.clone();
@@ -246,6 +257,11 @@ fn selftest(args: &[String]) -> Result<()> {
         enc, w1.decoder, preset.fps, p.kbps, p.drops, w1.margin_ms, w1.resyncs, w1.latency_ms
     );
     println!("{report}");
+    if let Some(slot) = sb.lock().unwrap().frames.get(&a_id) {
+        let f = slot.frame.lock().unwrap();
+        println!("      кадры для окна: {} шт., последний {}", slot.seq.load(std::sync::atomic::Ordering::Relaxed),
+            f.as_ref().map(|f| format!("{}×{} RGBA, {} байт", f.w, f.h, f.rgba.len())).unwrap_or_else(|| "нет".into()));
+    }
     if !w1.jitter.is_empty() {
         println!("      джиттер звука (насколько позже самого быстрого пакета): {}", w1.jitter);
     }

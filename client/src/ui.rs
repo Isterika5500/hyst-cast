@@ -2,7 +2,7 @@
 //! слева комната и участники, справа «сцена» с эфирами, снизу панель своего стрима.
 
 use crate::capture::{self, Source};
-use crate::config::{self, Config, PRESETS};
+use crate::config::{self, Config};
 use crate::net::{Cmd, SharedRef, Status};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, Pos2, Rect, RichText, Sense,
@@ -348,6 +348,39 @@ fn gradient_rect(p: &egui::Painter, rect: Rect, r: CornerRadius, a: Color32, b: 
     p.add(egui::Shape::mesh(mesh));
 }
 
+// ------------------------------------------------------------------ видео
+
+/// Обновить текстуру стрима из последнего кадра (если пришёл новый) и вернуть её.
+fn video_texture(ctx: &egui::Context, textures: &mut HashMap<u32, (egui::TextureHandle, u64)>, frames: &HashMap<u32, Arc<crate::watch::FrameSlot>>, id: u32) -> Option<egui::TextureHandle> {
+    let slot = frames.get(&id)?;
+    let seq = slot.seq.load(std::sync::atomic::Ordering::Relaxed);
+    let have = textures.get(&id).map(|t| t.1);
+    if have != Some(seq) {
+        if let Some(f) = slot.frame.lock().unwrap().take() {
+            let img = egui::ColorImage::from_rgba_premultiplied([f.w as usize, f.h as usize], &f.rgba);
+            match textures.get_mut(&id) {
+                Some((tex, s)) => {
+                    tex.set(img, egui::TextureOptions::LINEAR);
+                    *s = seq;
+                }
+                None => {
+                    let tex = ctx.load_texture(format!("stream-{id}"), img, egui::TextureOptions::LINEAR);
+                    textures.insert(id, (tex, seq));
+                }
+            }
+        }
+    }
+    textures.get(&id).map(|t| t.0.clone())
+}
+
+/// Нарисовать текстуру в прямоугольнике, сохранив пропорции (по краям — чёрные поля).
+fn paint_fit(p: &egui::Painter, rect: Rect, tex: &egui::TextureHandle) {
+    let ts = tex.size_vec2();
+    let k = (rect.width() / ts.x).min(rect.height() / ts.y);
+    let r = Rect::from_center_size(rect.center(), ts * k);
+    p.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+}
+
 // ------------------------------------------------------------------ приложение
 
 pub struct App {
@@ -359,6 +392,15 @@ pub struct App {
     volumes: HashMap<u32, f32>,
     show_server: bool,
     notice_dismissed: Option<String>,
+    /// Текстуры видео по id стримера: (текстура, номер последнего загруженного кадра).
+    textures: HashMap<u32, (egui::TextureHandle, u64)>,
+    /// Стрим, открытый крупно (как «фокус» в Discord).
+    focus: Option<u32>,
+    /// Когда включили фокус: пару секунд не сбрасываем его, пока контроллер не отметил просмотр.
+    focus_at: std::time::Instant,
+    fullscreen: bool,
+    /// Последний отправленный размер видео по id.
+    sent_size: HashMap<u32, (u32, u32)>,
 }
 
 const QUALITY: &[(&str, &str)] = &[("720p30", "720p"), ("720p60", "720p60"), ("1080p30", "1080p"), ("1080p60", "1080p60"), ("1440p60", "1440p")];
@@ -380,6 +422,11 @@ impl App {
             volumes: HashMap::new(),
             show_server,
             notice_dismissed: None,
+            textures: HashMap::new(),
+            focus: None,
+            focus_at: std::time::Instant::now(),
+            fullscreen: false,
+            sent_size: HashMap::new(),
         }
     }
 
@@ -550,11 +597,38 @@ impl App {
     // -------------------------------------------------------------- сцена
 
     fn stage(&mut self, ui: &mut egui::Ui) {
-        let (peers, watch) = {
+        let (peers, watch, frames) = {
             let s = self.shared.lock().unwrap();
-            (s.peers.clone(), s.watch.clone())
+            (s.peers.clone(), s.watch.clone(), s.frames.clone())
         };
         let live: Vec<_> = peers.iter().filter(|(_, p)| p.stream.is_some()).collect();
+        // Отладка/скриншоты: HYST_CAST_AUTOWATCH=1 — сам открыть первый эфир (=card — без «крупно»)
+        if let Ok(mode) = std::env::var("HYST_CAST_AUTOWATCH") {
+            if let Some((id, p)) = live.first() {
+                if !p.watching && self.focus.is_none() && !self.textures.contains_key(id) && !frames.contains_key(id) {
+                    let _ = self.tx.send(Cmd::Watch(**id));
+                    if mode != "card" {
+                        self.focus = Some(**id);
+                        self.focus_at = std::time::Instant::now();
+                    }
+                }
+            }
+        }
+        // Фокус на стриме, который уже не идёт, — сбрасываем
+        if let Some(f) = self.focus {
+            let alive = peers.get(&f).is_some_and(|p| p.stream.is_some() && (p.watching || self.focus_at.elapsed().as_secs_f32() < 3.0));
+            if !alive {
+                self.focus = None;
+            }
+        }
+        if let Some(f) = self.focus {
+            if let Some(p) = peers.get(&f) {
+                self.focused(ui, f, p, &frames);
+                return;
+            }
+        }
+        // Текстуры стримов, которые больше не смотрим, — освобождаем память
+        self.textures.retain(|id, _| frames.contains_key(id));
 
         ui.add_space(18.0);
         ui.horizontal(|ui| {
@@ -591,7 +665,7 @@ impl App {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
                     for (id, p) in row {
-                        ui.allocate_ui(Vec2::new(w, 0.0), |ui| self.stream_card(ui, **id, p, watch.get(id), w));
+                        ui.allocate_ui(Vec2::new(w, 0.0), |ui| self.stream_card(ui, **id, p, watch.get(id), w, &frames));
                     }
                 });
                 ui.add_space(gap);
@@ -599,21 +673,45 @@ impl App {
         });
     }
 
-    fn stream_card(&mut self, ui: &mut egui::Ui, id: u32, p: &crate::net::PeerView, w: Option<&crate::net::WatchStats>, width: f32) {
+    #[allow(clippy::too_many_arguments)]
+    fn stream_card(&mut self, ui: &mut egui::Ui, id: u32, p: &crate::net::PeerView, w: Option<&crate::net::WatchStats>, width: f32, frames: &HashMap<u32, Arc<crate::watch::FrameSlot>>) {
         let info = p.stream.clone().unwrap();
         Frame::new().fill(SURFACE).stroke(hairline()).corner_radius(CornerRadius::same(14)).inner_margin(Margin::same(0)).show(ui, |ui| {
             ui.set_width(width);
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
             // Превью 16:9: градиент цвета стримера, большая аватарка, плашки
-            let ph = (width * 9.0 / 16.0).min(260.0);
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, ph), Sense::hover());
+            let ph = width * 9.0 / 16.0;
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ph), Sense::click());
             let col = name_color(&p.name);
-            gradient_rect(ui.painter(), rect, CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 }, darken(col, 0.45), darken(col, 0.18));
-            let c = rect.center();
-            ui.painter().circle_filled(c, 36.0, col);
-            ui.painter().text(c, Align2::CENTER_CENTER, initials(&p.name), FontId::new(26.0, bold()), Color32::WHITE);
-            if p.watching {
-                ui.painter().text(c + Vec2::new(0.0, 54.0), Align2::CENTER_CENTER, "открыто в отдельном окне", FontId::new(12.5, FontFamily::Proportional), Color32::from_white_alpha(170));
+            let tex = if p.watching { video_texture(ui.ctx(), &mut self.textures, frames, id) } else { None };
+            if let Some(tex) = &tex {
+                ui.painter().rect_filled(rect, CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 }, Color32::BLACK);
+                paint_fit(ui.painter(), rect, tex);
+                self.want_size(ui.ctx(), id, rect, p);
+            } else {
+                gradient_rect(ui.painter(), rect, CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 }, darken(col, 0.45), darken(col, 0.18));
+                let c = rect.center();
+                ui.painter().circle_filled(c, 36.0, col);
+                ui.painter().text(c, Align2::CENTER_CENTER, initials(&p.name), FontId::new(26.0, bold()), Color32::WHITE);
+                if p.watching {
+                    ui.painter().text(c + Vec2::new(0.0, 54.0), Align2::CENTER_CENTER, "подключение…", FontId::new(12.5, FontFamily::Proportional), Color32::from_white_alpha(170));
+                }
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                if tex.is_some() {
+                    ui.painter().text(rect.center_bottom() - Vec2::new(0.0, 18.0), Align2::CENTER_CENTER, "нажми, чтобы открыть крупно", FontId::new(12.0, semibold()), Color32::from_white_alpha(200));
+                }
+            }
+            if resp.clicked() {
+                if p.watching {
+                    self.focus = Some(id);
+                    self.focus_at = std::time::Instant::now();
+                } else {
+                    let _ = self.tx.send(Cmd::Watch(id));
+                    self.focus = Some(id);
+                    self.focus_at = std::time::Instant::now();
+                }
             }
             paint_pill(ui.painter(), rect.left_top() + Vec2::new(12.0, 12.0), "● LIVE", LIVE, Color32::WHITE);
             let q = format!("{}p · {} fps", info.height, info.fps);
@@ -636,8 +734,14 @@ impl App {
                             if small_button(ui, "Закрыть", SURFACE_HI) {
                                 let _ = self.tx.send(Cmd::Unwatch(id));
                             }
+                            if small_button(ui, "Крупно", SURFACE_HI) {
+                                self.focus = Some(id);
+                    self.focus_at = std::time::Instant::now();
+                            }
                         } else if small_button(ui, "▶  Смотреть", ACCENT) {
                             let _ = self.tx.send(Cmd::Watch(id));
+                            self.focus = Some(id);
+                    self.focus_at = std::time::Instant::now();
                         }
                     });
                 });
@@ -666,6 +770,104 @@ impl App {
             });
             });
         });
+    }
+
+    // -------------------------------------------------------------- стрим крупно
+
+    fn focused(&mut self, ui: &mut egui::Ui, id: u32, p: &crate::net::PeerView, frames: &HashMap<u32, Arc<crate::watch::FrameSlot>>) {
+        if !self.fullscreen {
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if small_button(ui, "←  Все эфиры", SURFACE_HI) {
+                    self.focus = None;
+                }
+                ui.add_space(6.0);
+                avatar(ui, &p.name, 26.0, true);
+                ui.label(RichText::new(&p.name).font(FontId::new(16.0, semibold())));
+                pill(ui, "LIVE", LIVE, Color32::WHITE);
+                if let Some(s) = &p.stream {
+                    ui.label(RichText::new(format!("{}p · {} fps", s.height, s.fps)).size(12.5).color(TEXT3));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(&p.stats).size(12.0).color(TEXT3));
+                });
+            });
+            ui.add_space(10.0);
+        }
+        let rect = ui.available_rect_before_wrap();
+        let rect = if self.fullscreen { rect } else { rect.shrink2(Vec2::new(0.0, 0.0)) };
+        let resp = ui.allocate_rect(rect, Sense::click());
+        let r = if self.fullscreen { CornerRadius::ZERO } else { CornerRadius::same(14) };
+        ui.painter().rect_filled(rect, r, Color32::BLACK);
+        match video_texture(ui.ctx(), &mut self.textures, frames, id) {
+            Some(tex) => {
+                paint_fit(ui.painter(), rect, &tex);
+                self.want_size(ui.ctx(), id, rect, p);
+            }
+            None => {
+                ui.painter().text(rect.center(), Align2::CENTER_CENTER, "подключение…", FontId::new(14.0, semibold()), TEXT3);
+            }
+        }
+        if resp.double_clicked() {
+            self.set_fullscreen(ui.ctx(), !self.fullscreen);
+        }
+        // Полоса управления — при наведении мыши, поверх видео снизу
+        let hover = ui.rect_contains_pointer(rect);
+        let recently_moved = ui.input(|i| i.pointer.time_since_last_movement() < 2.5);
+        if hover && recently_moved {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+            let bar = Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - 64.0), rect.right_bottom());
+            let mut mesh = egui::Mesh::default();
+            mesh.colored_vertex(bar.left_top(), Color32::TRANSPARENT);
+            mesh.colored_vertex(bar.right_top(), Color32::TRANSPARENT);
+            mesh.colored_vertex(bar.right_bottom(), Color32::from_black_alpha(190));
+            mesh.colored_vertex(bar.left_bottom(), Color32::from_black_alpha(190));
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(0, 2, 3);
+            ui.painter().add(egui::Shape::mesh(mesh));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar.shrink2(Vec2::new(18.0, 14.0))).layout(Layout::left_to_right(Align::Max)));
+            let has_audio = p.stream.as_ref().is_some_and(|s| s.has_audio);
+            if has_audio {
+                child.label(RichText::new("Громкость").size(12.5).color(Color32::from_white_alpha(220)));
+                let vol = self.volumes.entry(id).or_insert(1.0);
+                child.spacing_mut().slider_width = 140.0;
+                if child.add(egui::Slider::new(vol, 0.0..=1.5).show_value(false)).changed() {
+                    let _ = self.tx.send(Cmd::Volume(id, *vol as f64));
+                }
+            }
+            child.with_layout(Layout::right_to_left(Align::Max), |ui| {
+                if small_button(ui, "Закрыть", Color32::from_rgba_unmultiplied(0x30, 0x30, 0x35, 230)) {
+                    let _ = self.tx.send(Cmd::Unwatch(id));
+                    self.focus = None;
+                    self.set_fullscreen(ui.ctx(), false);
+                }
+                let label = if self.fullscreen { "Выйти из полноэкранного" } else { "На весь экран" };
+                if small_button(ui, label, Color32::from_rgba_unmultiplied(0x30, 0x30, 0x35, 230)) {
+                    let fs = !self.fullscreen;
+                    self.set_fullscreen(ui.ctx(), fs);
+                }
+            });
+        }
+    }
+
+    /// Сообщить зрителю, сколько пикселей реально занимает видео (с шагом 64, не больше исходника и 1080p).
+    fn want_size(&mut self, ctx: &egui::Context, id: u32, rect: Rect, p: &crate::net::PeerView) {
+        let Some(s) = &p.stream else { return };
+        let (sw, sh) = crate::watch::display_size(s.width, s.height);
+        let ppp = ctx.pixels_per_point();
+        let k = ((rect.width() * ppp) / sw as f32).min((rect.height() * ppp) / sh as f32).min(1.0);
+        let w = (((sw as f32 * k) / 64.0).ceil() as u32 * 64).min(sw);
+        let h = ((w as f32 * sh as f32 / sw as f32) as u32) & !1;
+        let changed = self.sent_size.get(&id).is_none_or(|&(ow, _)| (ow as i32 - w as i32).abs() >= 64);
+        if changed && w >= 64 {
+            self.sent_size.insert(id, (w, h));
+            let _ = self.tx.send(Cmd::DisplaySize(id, w, h));
+        }
+    }
+
+    fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        self.fullscreen = on;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
     }
 
     // -------------------------------------------------------------- свой стрим
@@ -815,8 +1017,24 @@ impl eframe::App for App {
             self.cfg.save();
         }
         let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.fullscreen {
+                self.set_fullscreen(&ctx, false);
+            } else {
+                self.focus = None;
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F)) && self.focus.is_some() && !ctx.egui_wants_keyboard_input() {
+            let fs = !self.fullscreen;
+            self.set_fullscreen(&ctx, fs);
+        }
+        if self.fullscreen && (self.focus.is_none() || status != Status::Online) {
+            self.set_fullscreen(&ctx, false);
+        }
 
-        if status == Status::Online {
+        if status == Status::Online && self.fullscreen {
+            egui::CentralPanel::default().frame(Frame::new().fill(Color32::BLACK)).show(ui, |ui| self.stage(ui));
+        } else if status == Status::Online {
             egui::Panel::left("sidebar")
                 .resizable(false)
                 .exact_size(250.0)
