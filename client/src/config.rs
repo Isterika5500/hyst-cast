@@ -45,6 +45,8 @@ pub struct Config {
     pub encoder: String,
     /// Linux: токен портала, чтобы не выбирать экран каждый раз.
     pub portal_token: Option<String>,
+    /// Заходить в комнату сразу при запуске (сбрасывается кнопкой «Выйти»).
+    pub auto_join: bool,
 }
 
 impl Default for Config {
@@ -60,6 +62,7 @@ impl Default for Config {
             latency_ms: 150,
             encoder: String::new(),
             portal_token: None,
+            auto_join: false,
         }
     }
 }

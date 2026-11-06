@@ -1,0 +1,2 @@
+Inter — шрифт Rasmus Andersson, лицензия SIL Open Font License 1.1 (https://openfontlicense.org).
+Взят с Google Fonts, в программу встроены начертания 400/600/700.

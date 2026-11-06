@@ -94,14 +94,15 @@ fn run_gui() -> Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("hyst-cast")
             .with_app_id("hyst-cast")
-            .with_inner_size([420.0, 580.0])
-            .with_min_inner_size([340.0, 380.0]),
+            .with_inner_size([1040.0, 680.0])
+            .with_min_inner_size([760.0, 520.0]),
         ..Default::default()
     };
     eframe::run_native(
         "hyst-cast",
         opts,
         Box::new(move |cc| {
+            ui::setup(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             let repaint: net::Repaint = Arc::new(move || ctx.request_repaint());
             let tx = net::spawn(&handle, shared.clone(), repaint, watch::SinkMode::Window);
@@ -161,7 +162,7 @@ fn selftest(args: &[String]) -> Result<()> {
     let preset = config::preset(&arg(args, "--preset").unwrap_or_else(|| "720p30".into()));
     let encoder = arg(args, "--encoder").unwrap_or_default();
     let show = args.iter().any(|a| a == "--show");
-    let room = format!("selftest-{}", std::process::id());
+    let room = arg(args, "--room").unwrap_or_else(|| format!("selftest-{}", std::process::id()));
 
     let rt = runtime()?;
     let mk = |name: &str, server: &str| config::Config {

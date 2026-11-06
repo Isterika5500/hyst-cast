@@ -22,7 +22,7 @@ pub enum Source {
 pub fn list_sources() -> Vec<(Source, String)> {
     let mut v = Vec::new();
     #[cfg(target_os = "linux")]
-    v.push((Source::Portal, "Экран или окно (выбор в системном окне)".to_string()));
+    v.push((Source::Portal, "Экран или окно…".to_string()));
     #[cfg(windows)]
     {
         v.extend(win::monitors());
