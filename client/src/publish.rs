@@ -103,7 +103,9 @@ pub async fn start(
     link: Arc<Link>,
 ) -> Result<Publisher> {
     let capture = capture::open(&source, preset.fps, (preset.width, preset.height), portal_token).await?;
-    let akind = if source == Source::Test {
+    let akind = if source == Source::Test && std::env::var("HYST_CAST_SYSTEM_AUDIO").is_ok() {
+        capture::AudioKind::System
+    } else if source == Source::Test {
         capture::AudioKind::Test
     } else if source.is_camera() {
         capture::AudioKind::Mic
@@ -162,6 +164,10 @@ pub async fn start(
 }
 
 pub fn probe_audio(desc: &str) -> bool {
+    if desc == capture::PW_APPS {
+        // Проверяем, что pw-dump отвечает: дальше источники подключаются по ходу
+        return cfg!(target_os = "linux") && std::process::Command::new("pw-dump").output().is_ok_and(|o| o.status.success());
+    }
     let Ok(el) = gst::parse::launch(&format!("{desc} ! fakesink name=s")) else { return false };
     let Ok(p) = el.downcast::<gst::Pipeline>() else { return false };
     let got = Arc::new(AtomicBool::new(false));
@@ -205,7 +211,12 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio_desc: Op
     if audio {
         desc.push_str(&format!(
             " {} ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=128000 frame-size=20 audio-type=generic ! appsink name=asink sync=false max-buffers=50",
-            audio_desc.as_deref().unwrap_or_default()
+            if audio_desc.as_deref() == Some(capture::PW_APPS) {
+                // Тишина держит микшер «живым», приложения подключаются к amix на лету
+                "audiotestsrc is-live=true wave=silence ! audio/x-raw,rate=48000,channels=2 ! audiomixer name=amix latency=50000000"
+            } else {
+                audio_desc.as_deref().unwrap_or_default()
+            }
         ));
     }
     info!("конвейер стрима: {desc}");
@@ -283,6 +294,7 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio_desc: Op
     }
     info!("стрим идёт: кодер {} за {} мс", encoder.label(), t.elapsed().as_millis());
     SENDER_BASE_NS.store(pipeline.base_time().map(|b| b.nseconds()).unwrap_or(0), Ordering::Relaxed);
+    let apps_watch = audio_desc.as_deref() == Some(capture::PW_APPS);
 
     // Дальше ошибки конвейера ловит отдельный поток
     let error = Arc::new(Mutex::new(None));
@@ -293,6 +305,11 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio_desc: Op
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 if let Some(m) = bus.timed_pop_filtered(gst::ClockTime::from_mseconds(250), &[gst::MessageType::Error, gst::MessageType::Eos]) {
+                    // Ошибки ветки отдельного приложения (оно закрылось) — не повод останавливать стрим
+                    if m.src().is_some_and(|s| s.path_string().contains(":app_")) {
+                        info!("звук приложения отключился: {:?}", m.src().map(|s| s.path_string()));
+                        continue;
+                    }
                     let text = match m.view() {
                         gst::MessageView::Error(e) => format!("{}", e.error()),
                         _ => "источник картинки закрылся".to_string(),
@@ -305,6 +322,11 @@ fn try_start(video_desc: &str, encoder: &Encoder, preset: Preset, audio_desc: Op
         });
     }
 
+    #[cfg(target_os = "linux")]
+    if apps_watch {
+        spawn_app_mixer(pipeline.clone(), stop_bus.clone());
+    }
+    let _ = apps_watch;
     Ok(Publisher {
         pipeline,
         enc,
@@ -484,4 +506,60 @@ impl Publisher {
         }
         self.last_drops = drops;
     }
+}
+
+/// Linux: раз в 2 с сверяем потоки приложений в PipeWire с ветками микшера amix:
+/// новые (кроме Discord и себя) подключаем, исчезнувшие отключаем.
+#[cfg(target_os = "linux")]
+fn spawn_app_mixer(pipeline: gst::Pipeline, stop: Arc<AtomicBool>) {
+    use std::collections::HashMap;
+    std::thread::spawn(move || {
+        let Some(amix) = pipeline.by_name("amix") else { return };
+        let mut branches: HashMap<u64, (gst::Element, gst::Pad)> = HashMap::new();
+        while !stop.load(Ordering::Relaxed) {
+            let streams = capture::pw_app_streams();
+            let want: HashMap<u64, String> = streams.iter().filter(|s| !s.2).map(|s| (s.0, s.1.clone())).collect();
+            for (serial, name) in &want {
+                if branches.contains_key(serial) {
+                    continue;
+                }
+                let desc = format!(
+                    "pipewiresrc target-object={serial} do-timestamp=true ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream"
+                );
+                let Ok(bin) = gst::parse::bin_from_description(&desc, true) else { continue };
+                let bin = bin.upcast::<gst::Element>();
+                let _ = bin.set_property("name", format!("app_{serial}"));
+                let Some(sink) = amix.request_pad_simple("sink_%u") else { continue };
+                if pipeline.add(&bin).is_err() {
+                    amix.release_request_pad(&sink);
+                    continue;
+                }
+                if bin.static_pad("src").map(|p| p.link(&sink)).is_none_or(|r| r.is_err()) || bin.sync_state_with_parent().is_err() {
+                    let _ = bin.set_state(gst::State::Null);
+                    let _ = pipeline.remove(&bin);
+                    amix.release_request_pad(&sink);
+                    continue;
+                }
+                info!("звук в стрим: {name}");
+                branches.insert(*serial, (bin, sink));
+            }
+            let gone: Vec<u64> = branches.keys().filter(|k| !want.contains_key(k)).copied().collect();
+            for serial in gone {
+                if let Some((bin, sink)) = branches.remove(&serial) {
+                    let _ = bin.set_state(gst::State::Null);
+                    let _ = pipeline.remove(&bin);
+                    amix.release_request_pad(&sink);
+                }
+            }
+            for s in streams.iter().filter(|s| s.2) {
+                tracing::debug!("не захватываю: {}", s.1);
+            }
+            for _ in 0..8 {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    });
 }

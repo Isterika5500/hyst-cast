@@ -157,6 +157,10 @@ fn wait_until(what: &str, timeout: Duration, mut f: impl FnMut() -> Option<Resul
 
 /// Полный цикл без окна. Код возврата 0 — всё работает.
 fn selftest(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--system-audio") {
+        // SAFETY: до запуска рантайма и потоков
+        unsafe { std::env::set_var("HYST_CAST_SYSTEM_AUDIO", "1") };
+    }
     let server = arg(args, "--server").unwrap_or_else(|| "127.0.0.1:4433".into());
     let viewer_server = arg(args, "--viewer-server").unwrap_or_else(|| server.clone());
     let fingerprint = match (arg(args, "--fp"), arg(args, "--cert")) {
@@ -252,9 +256,12 @@ fn selftest(args: &[String]) -> Result<()> {
     std::thread::sleep(Duration::from_secs(seconds));
     let w1 = snap(&sb);
     let dt = t0.elapsed().as_secs_f64();
+    let still_live = sa.lock().unwrap().publishing.is_some();
+    let still_watching = sb.lock().unwrap().watch.contains_key(&a_id);
     let p = sa.lock().unwrap().publishing.clone().unwrap_or_default();
-    let fps = (w1.rendered - w0.rendered) as f64 / dt;
-    let audio_rate = (w1.audio_rendered - w0.audio_rendered) as f64 / dt;
+    // saturating: если просмотр пропал, счётчики обнулились — это провал, а не «огромный fps»
+    let fps = w1.rendered.saturating_sub(w0.rendered) as f64 / dt;
+    let audio_rate = w1.audio_rendered.saturating_sub(w0.audio_rendered) as f64 / dt;
 
     println!("[5/5] итог");
     println!("      стример: {}", p.stats);
@@ -278,6 +285,12 @@ fn selftest(args: &[String]) -> Result<()> {
     }
 
     let mut problems = Vec::new();
+    if !still_live {
+        problems.push("стрим остановился во время проверки".to_string());
+    }
+    if !still_watching {
+        problems.push("просмотр прервался во время проверки".to_string());
+    }
     if args.iter().any(|a| a == "--extended") {
         let ctx = Ext { rt: rt.handle().clone(), sa: sa.clone(), sb: sb.clone(), ta: ta.clone(), tb: tb.clone(), mk: &mk, server: server.clone(), preset };
         problems.extend(extended(&ctx));

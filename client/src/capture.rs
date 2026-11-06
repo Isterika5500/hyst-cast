@@ -177,6 +177,36 @@ pub fn audio_desc(kind: AudioKind) -> String {
     return "pulsesrc device=@DEFAULT_MONITOR@ do-timestamp=true".into();
 }
 
+/// Особый вариант звука на Linux: микшер из потоков отдельных приложений (собирается в publish.rs).
+pub const PW_APPS: &str = "pw-apps";
+
+/// Кого не захватывать: голосовые чаты (иначе голоса звучат у друзей дважды) и сам hyst-cast.
+pub fn excluded_app(name: &str, binary: &str, pid: u32) -> bool {
+    let s = format!("{} {}", name.to_lowercase(), binary.to_lowercase());
+    pid == std::process::id()
+        || ["discord", "vesktop", "webcord", "armcord", "legcord", "equibop", "hyst-cast"].iter().any(|x| s.contains(x))
+}
+
+/// Потоки воспроизведения приложений сейчас (Linux, через pw-dump): serial → «имя (программа)».
+#[cfg(target_os = "linux")]
+pub fn pw_app_streams() -> Vec<(u64, String, bool)> {
+    let Ok(out) = std::process::Command::new("pw-dump").output() else { return Vec::new() };
+    let Ok(all) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else { return Vec::new() };
+    let mut v = Vec::new();
+    for o in all.as_array().into_iter().flatten() {
+        let p = &o["info"]["props"];
+        if p["media.class"] != "Stream/Output/Audio" {
+            continue;
+        }
+        let Some(serial) = p["object.serial"].as_u64() else { continue };
+        let name = p["application.name"].as_str().unwrap_or("");
+        let bin = p["application.process.binary"].as_str().unwrap_or("");
+        let pid = p["application.process.id"].as_u64().unwrap_or(0) as u32;
+        v.push((serial, format!("{name} ({bin})"), excluded_app(name, bin, pid)));
+    }
+    v
+}
+
 /// Варианты захвата звука по убыванию предпочтения: (описание для конвейера, подпись для человека).
 /// Windows 10 2004+/11 умеет захват по процессам: окно — только звук этого приложения, экран —
 /// всё, кроме Discord (иначе голоса из звонка у друзей звучат дважды). Если не вышло — обычный захват.
@@ -200,6 +230,11 @@ pub fn audio_candidates(kind: AudioKind, source: &Source) -> Vec<(String, String
                 }
             }
         }
+    }
+    // Linux: свой микшер приложений через PipeWire — без Discord и без самого hyst-cast
+    #[cfg(target_os = "linux")]
+    if kind == AudioKind::System && gstreamer::ElementFactory::find("pipewiresrc").is_some() && gstreamer::ElementFactory::find("audiomixer").is_some() {
+        v.push((PW_APPS.to_string(), "звук приложений, кроме Discord".to_string()));
     }
     let _ = source;
     let hint = match kind {
